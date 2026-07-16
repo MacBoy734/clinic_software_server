@@ -1,0 +1,66 @@
+const express = require('express')
+const c = require('../controllers/admin_controller')
+const router = express.Router()
+const { authenticate, authorize } = require('../middleware/auth')
+
+// All routes in this router require authentication and admin authorization
+router.use(authenticate, authorize('admin'))
+
+// GET routes
+router.get('/staff', c.getAllStaff)
+router.get('/lab-requests', c.getLabRequests)
+router.get('/restocks', c.getRestocks)
+router.get('/overview', c.getAdminOverview)
+router.get('/lab-stats', c.getLabStats)
+router.get('/charge-templates', c.getChargeTemplates)
+router.get('/revenue-report', c.getAdminRevenueReport)
+router.get('/visits-report', c.getAdminVisitsReport)
+router.get('/referrals', c.getReferrals)
+router.get('/lab-stock', c.getLabStock)
+router.get('/drug-stock', c.getDrugStock)
+router.get('/lab-techs', c.getLabTechs)
+router.get('/logs', c.getLogs)
+router.get('/logs/stats', c.getLogStats)
+router.get('/sessions', c.getSessions)
+router.get('/patients', c.getPatients)
+router.get('/patients/stats',  c.getPatientStats)
+router.get('/patients/:id',    c.getPatientDetail)
+router.get('/bills',    c.getBills)
+router.get('/bills/queue', c.getBillingQueueToday)
+router.get('/payments', c.getPayments)
+router.get('/revenue/week', c.getRevenueWeek)
+router.get('/finance/revenue', c.getRevenueReport)
+router.get('/settings', c.getSettings)
+
+// POST routes
+router.post('/referrals', c.createReferral)
+router.post('/charge-templates', c.createChargeTemplate)
+router.post('/drug-stock', c.createDrugStockItem)
+router.post('/staff', c.addStaffPost)
+router.post('/lab-stock', c.createLabStockItem)
+
+// PATCH routes
+router.patch('/referrals/:id/pay', c.payReferral)
+router.patch('/restocks/:id/verify', c.verifyRestock)
+router.patch('/restocks/:id/reject', c.rejectRestock)
+router.patch('/charge-templates/:id', c.updateChargeTemplate)
+router.patch('/lab-stock/:id/quantity', c.updateLabStockQuantity)
+router.patch('/staff/:id', c.toggleStaffStatus)
+router.patch('/settings', c.patchSettings)
+router.patch('/staff/:id/password', c.resetStaffPassword)
+
+// PUT routes
+router.put('/drug-stock/:id', c.updateDrugStockItem)
+router.put('/drug-stock/:id/quantity', c.updateDrugStockQuantity)
+router.put('/lab-stock/:id', c.updateLabStockItem)
+
+// DELETE routes
+router.delete('/drug-stock/:id', c.deleteDrugStockItem)
+router.delete('/charge-templates/:id', c.deleteChargeTemplate)
+router.delete('/sessions/:id', c.deleteSession)
+router.delete('/lab-stock/:id', c.deleteLabStockItem)
+
+
+
+
+module.exports = router
