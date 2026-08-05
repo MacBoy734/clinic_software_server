@@ -7,6 +7,7 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+
 // ─── Enums ────────────────────────────────────────────────────────────────────
 
 enum Role {
@@ -56,6 +57,7 @@ enum PaymentMethod {
   cash
   mpesa
   insurance
+  credit
   other
 }
 
@@ -76,13 +78,12 @@ enum RestockDepartment {
   lab
 }
 
-
 enum PrescriptionStatus {
-  pending     
-  dispensed  
-  issued     
-  returned   
-  cancelled 
+  pending
+  dispensed
+  issued
+  returned
+  cancelled
 }
 
 enum PrescriptionItemStatus {
@@ -108,18 +109,38 @@ enum PharmacyTxType {
   adjustment
 }
 
-// ADDED: urgency level for lab orders
 enum LabUrgency {
   routine
   urgent
   stat
 }
 
-// ADDED: pharmacy supply order status
 enum OrderStatus {
   pending
   fulfilled
   cancelled
+}
+
+enum ProductCategory {
+  medication  
+  consumable  
+  general
+}
+enum MovementReason {
+  sale           
+  dispense       
+  issue           
+  restock        
+  return_to_stock 
+  adjustment     
+  writeoff        
+}
+
+enum OrderDepartment {
+  doctor
+  lab
+  reception
+  admin
 }
 
 // ─── Staff ────────────────────────────────────────────────────────────────────
@@ -133,15 +154,20 @@ model Staff {
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
 
-  visits_as_doctor Visit[] @relation("DoctorVisits")
-  lab_requests_handled  LabRequest[] @relation("LabTechRequests")
-  prescriptions_handled Prescription[]  @relation("PharmacistPrescriptions")
-  payments_collected  Payment[] @relation("CashierPayments")
-  sessions Session[]
-  clinic_expenses  ClinicExpense[]
-  pharmacy_expenses PharmacyExpense[]
-  otc_sales  OtcSale[]  @relation("OtcSoldBy")
-  audit_logs  AuditLog[]
+  visits_as_doctor      Visit[]           @relation("DoctorVisits")
+  lab_requests_handled  LabRequest[]      @relation("LabTechRequests")
+  prescriptions_handled Prescription[]    @relation("PharmacistPrescriptions")
+  payments_collected    Payment[]         @relation("CashierPayments")
+  sessions              Session[]
+  clinic_expenses       ClinicExpense[]
+  pharmacy_expenses     PharmacyExpense[]
+  otc_sales             OtcSale[]         @relation("OtcSoldBy")
+  audit_logs            AuditLog[]
+  customer_payments    CustomerPayment[] 
+
+  orders_requested PharmacyOrder[] @relation("OrderRequestedBy")
+  orders_fulfilled PharmacyOrder[] @relation("OrderFulfilledBy")
+  stock_movements  StockMovement[]
 
   @@map("staff")
 }
@@ -157,65 +183,63 @@ model Session {
 
   staff Staff @relation(fields: [staff_id], references: [id], onDelete: Cascade)
 
+  @@index([expires_at])
   @@map("sessions")
 }
 
 // ─── Patient ──────────────────────────────────────────────────────────────────
 
 model Patient {
-  id            Int       @id @default(autoincrement())
-  name          String
-  age Int
-  gender        Gender
-  phone         String?
-  national_id   String?   @unique
-  blood_group   String?
-  allergies     String?
-  created_at    DateTime  @default(now())
-  updated_at    DateTime  @updatedAt
+  id          Int      @id @default(autoincrement())
+  name        String
+  age         Int
+  gender      Gender
+  phone       String?
+  national_id String?  @unique
+  blood_group String?
+  allergies   String?
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
 
   visits Visit[]
 
+  @@index([name])
+  @@index([phone])
   @@map("patients")
 }
 
 // ─── Visit ────────────────────────────────────────────────────────────────────
 
 model Visit {
-  id             Int         @id @default(autoincrement())
-  patient_id     Int
-  doctor_id      Int?
-  queue_number   Int?
-  visit_type     VisitType   @default(direct_lab)
-  status         VisitStatus @default(waiting)
+  id           Int         @id @default(autoincrement())
+  patient_id   Int
+  doctor_id    Int?
+  queue_number Int?
+  visit_type   VisitType   @default(direct_lab)
+  status       VisitStatus @default(waiting)
 
-  // ADDED: receptionist captures chief complaint at registration
   chief_complaint String?
 
-  // ADDED: SOAP note fields — stored directly on Visit for simplicity
-  subjective  String?
-  objective   String?
-  assessment  String?
-  plan        String?
+  subjective String?
+  objective  String?
+  assessment String?
+  plan       String?
 
-  // Diagnosis
   diagnosis      String?
-  // ADDED: ICD code for the diagnosis
   diagnosis_code String?
 
-  notes          String?
+  notes String?
 
-  // Procedure / service performed during consultation (complete-procedure)
   procedure_name    String?
-  procedure_type    String? // 'procedure' | 'family_planning'
+  procedure_type    String?
   procedure_notes   String?
   procedure_done_by String?
 
-  // Direct lab only
   referred_by    String?
   referrer_phone String?
-  referral Referral?
-  has_lab_results        Boolean @default(false)
+  referral       Referral?
+
+  has_lab_results         Boolean @default(false)
   medication_verification Boolean @default(false)
 
   arrived_at DateTime @default(now())
@@ -228,30 +252,34 @@ model Visit {
   prescriptions Prescription[]
   bill          Bill?
 
+  @@index([status, arrived_at])
+  @@index([patient_id, arrived_at])
+  @@index([doctor_id])
   @@map("visits")
 }
 
 // ─── Vitals ───────────────────────────────────────────────────────────────────
 
 model Vitals {
-  id              Int      @id @default(autoincrement())
-  visit_id        Int      @unique
-  weight_kg       Float?
-  height_cm       Float?
-  bp_systolic     Int?
-  bp_diastolic    Int?
-  temperature     Float?
-  pulse           Int?
-  spo2            Int?
-  // ADDED: respiratory rate and free-text notes on vitals
+  id               Int      @id @default(autoincrement())
+  visit_id         Int      @unique
+  weight_kg        Float?
+  height_cm        Float?
+  bp_systolic      Int?
+  bp_diastolic     Int?
+  temperature      Float?
+  pulse            Int?
+  spo2             Int?
   respiratory_rate Int?
-  vitals_notes    String?
-  recorded_at     DateTime @default(now())
+  vitals_notes     String?
+  recorded_at      DateTime @default(now())
 
   visit Visit @relation(fields: [visit_id], references: [id], onDelete: Cascade)
 
   @@map("vitals")
 }
+
+// ─── Lab ──────────────────────────────────────────────────────────────────────
 
 model LabRequest {
   id           Int        @id @default(autoincrement())
@@ -264,18 +292,21 @@ model LabRequest {
   requested_at DateTime   @default(now())
   completed_at DateTime?
   updated_at   DateTime   @updatedAt
-  visit Visit  @relation(fields: [visit_id], references: [id], onDelete: Cascade)
-  tech  Staff? @relation("LabTechRequests", fields: [tech_id], references: [id])
+
+  visit Visit            @relation(fields: [visit_id], references: [id], onDelete: Cascade)
+  tech  Staff?           @relation("LabTechRequests", fields: [tech_id], references: [id])
   items LabRequestItem[]
 
+  @@index([visit_id])
+  @@index([status, requested_at])
   @@map("lab_requests")
 }
 
 model LabRequestItem {
   id              Int       @id @default(autoincrement())
   lab_request_id  Int
-  catalog_id      Int?      // FK to LabTestCatalog
-  test_name       String    // denormalised for display even if catalog entry is deleted
+  catalog_id      Int?
+  test_name       String
   category        String?
   reference_range String?
   unit_cost       Int       @default(0)
@@ -288,22 +319,26 @@ model LabRequestItem {
   created_at      DateTime  @default(now())
   updated_at      DateTime  @updatedAt
 
-  lab_request     LabRequest      @relation(fields: [lab_request_id], references: [id], onDelete: Cascade)
-  catalog         LabTestCatalog? @relation(fields: [catalog_id], references: [id], onDelete: SetNull)
+  lab_request LabRequest      @relation(fields: [lab_request_id], references: [id], onDelete: Cascade)
+  catalog     LabTestCatalog? @relation(fields: [catalog_id], references: [id], onDelete: SetNull)
 
+  stock_usages LabStockUsage[]
+
+  @@index([lab_request_id])
+  @@index([catalog_id])
   @@map("lab_request_items")
 }
 
 model LabTestCatalog {
-  id              Int              @id @default(autoincrement())
-  name            String           @unique
+  id              Int     @id @default(autoincrement())
+  name            String  @unique
   category        String?
   reference_range String?
-  unit_cost       Int              @default(0)
-  is_active       Boolean          @default(true)
+  unit_cost       Int     @default(0)
+  is_active       Boolean @default(true)
   result_template Json?
 
-  items           LabRequestItem[]
+  items LabRequestItem[]
 
   @@map("lab_test_catalog")
 }
@@ -311,7 +346,7 @@ model LabTestCatalog {
 model LabStock {
   id            Int       @id @default(autoincrement())
   name          String
-  category      String?   // hematology | chemistry | urinalysis | supplies | microbiology
+  category      String?
   current_stock Int       @default(0)
   reorder_level Int       @default(0)
   unit          String    @default("units")
@@ -322,7 +357,31 @@ model LabStock {
   created_at    DateTime  @default(now())
   updated_at    DateTime  @updatedAt
 
+  usages           LabStockUsage[]
+  restock_requests RestockRequest[]
+
   @@map("lab_stock")
+}
+
+model LabStockUsage {
+  id                  Int      @id @default(autoincrement())
+  lab_request_item_id Int
+  stock_item_id       Int?
+  item_name           String
+  quantity            Int
+  quantity_deducted   Int      @default(0)
+  unit                String?
+  unit_cost           Int      @default(0)
+  recorded_by         Int?
+  created_at          DateTime @default(now())
+  updated_at          DateTime @updatedAt
+
+  lab_request_item LabRequestItem @relation(fields: [lab_request_item_id], references: [id], onDelete: Cascade)
+  stock_item       LabStock?      @relation(fields: [stock_item_id], references: [id], onDelete: SetNull)
+
+  @@unique([lab_request_item_id, stock_item_id])
+  @@index([stock_item_id])
+  @@map("lab_stock_usage")
 }
 
 // ─── Prescription ─────────────────────────────────────────────────────────────
@@ -337,156 +396,277 @@ model Prescription {
   verified_by   String?
   verified_at   DateTime?
   verify_notes  String?
-  // ADDED: return fields when doctor sends prescription back to pharmacy
   returned_by   String?
   returned_at   DateTime?
   return_reason String?
-  cancelled_by   String?
-  cancelled_at   DateTime?
-  cancel_reason  String?
+  cancelled_by  String?
+  cancelled_at  DateTime?
+  cancel_reason String?
 
-  dispensed_at  DateTime?
-  created_at    DateTime   @default(now())
-  updated_at    DateTime   @updatedAt
+  dispensed_at DateTime?
+  created_at   DateTime  @default(now())
+  updated_at   DateTime  @updatedAt
 
-  visit      Visit   @relation(fields: [visit_id], references: [id], onDelete: Cascade)
-  pharmacist Staff?   @relation("PharmacistPrescriptions", fields: [pharmacist_id], references: [id])
+  visit      Visit              @relation(fields: [visit_id], references: [id], onDelete: Cascade)
+  pharmacist Staff?             @relation("PharmacistPrescriptions", fields: [pharmacist_id], references: [id])
   items      PrescriptionItem[]
 
+  @@index([visit_id])
+  @@index([status])
   @@map("prescriptions")
 }
 
 model PrescriptionItem {
-  id              Int                    @id @default(autoincrement())
+  id              Int     @id @default(autoincrement())
   prescription_id Int
-  drug_name       String
+  drug_name       String  
   dosage          String
   frequency       String
   duration        String
-  quantity        Int                    @default(1)
-  unit_cost       Int                    @default(0)
-  // 'oral' | 'injection' — set by the doctor's prescription modal
+  quantity        Int     @default(1)
+  unit_cost       Int     @default(0)
   form            String?
-  // Reason the doctor returned an issued item (distinct from decline_reason)
   return_reason   String?
-  // FK to DrugStock — what lets confirm-restock increment the exact drug
-  drug_id         Int?
-  status          PrescriptionItemStatus @default(pending)
-  // Reason used when the pharmacist declines an individual item
-  decline_reason  String?
-  dispensed_at    DateTime?
+  product_id Int?
 
-  drug         DrugStock?   @relation(fields: [drug_id], references: [id], onDelete: SetNull)
+  status         PrescriptionItemStatus @default(pending)
+  decline_reason String?
+  dispensed_at   DateTime?
+
+  product      Product?     @relation(fields: [product_id], references: [id], onDelete: SetNull)
   prescription Prescription @relation(fields: [prescription_id], references: [id], onDelete: Cascade)
 
+  @@index([prescription_id])
+  @@index([product_id])
   @@map("prescription_items")
 }
 
 
 model PharmacyOrder {
-  id           Int         @id @default(autoincrement())
-  department   String      // 'doctor' | 'lab' | other departments
-  requested_by String      // staff name
-  status       OrderStatus @default(pending)
-  fulfilled_by String?     // pharmacist name
-  fulfilled_at DateTime?
-  requested_at DateTime    @default(now())
-  updated_at   DateTime    @updatedAt
+  id              Int             @id @default(autoincrement())
+  department      OrderDepartment
+  requested_by    String 
+  requested_by_id Int?
+  status          OrderStatus     @default(pending)
+  fulfilled_by    String?
+  fulfilled_by_id Int?
+  fulfilled_at    DateTime?
+  cancelled_by    String?
+  cancelled_at    DateTime?
+  cancel_reason   String?
+  notes           String?
+  requested_at    DateTime        @default(now())
+  updated_at      DateTime        @updatedAt
+
+  requester Staff? @relation("OrderRequestedBy", fields: [requested_by_id], references: [id], onDelete: SetNull)
+  fulfiller Staff? @relation("OrderFulfilledBy", fields: [fulfilled_by_id], references: [id], onDelete: SetNull)
 
   items PharmacyOrderItem[]
 
+  @@index([status, requested_at])
+  @@index([department, status])
   @@map("pharmacy_orders")
 }
 
 model PharmacyOrderItem {
-  id       Int    @id @default(autoincrement())
+  id       Int     @id @default(autoincrement())
   order_id Int
-  name     String
-  quantity Int    @default(1)
+  name     String  
+  quantity Int     @default(1)
   notes    String?
 
-  order PharmacyOrder @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  product_id    Int?
+  fulfilled_qty Int  @default(0)
 
+  order   PharmacyOrder @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  product Product?      @relation(fields: [product_id], references: [id], onDelete: SetNull)
+
+  @@index([order_id])
+  @@index([product_id])
   @@map("pharmacy_order_items")
 }
 
-model DrugStock {
-  id            Int       @id @default(autoincrement())
-  name          String    @unique
-  generic_name  String    @default("")
-  category      String?   // antibiotic | analgesic | antihypertensive | etc.
-  form          String?   // tablet | capsule | syrup | injection | etc.
-  strength      String?   // e.g. "500mg", "250mg/5ml"
-  current_stock Int       @default(0)
-  unit          String    @default("tablets")
-  reorder_level Int       @default(50)
-  expiry_date   DateTime?
-  // StockTab's expandable row reads supplier + batch_number
-  supplier      String?
-  batch_number  String?
-  unit_cost     Int       @default(0)   // pharmacy's buying/cost price
+// ─── Product ──────────────────────────────────────────────────
 
-  // 3 OTC sale tiers — these ARE the markup system (no separate 4th
-  // "clinic price" column; that's computed, not stored)
+model Product {
+  id   Int     @id @default(autoincrement())
+  sku  String? @unique
+  name String  @unique
+
+  category ProductCategory @default(medication)
+  sub_category String?
+
+  unit      String  @default("piece")
+  is_active Boolean @default(true) 
+  generic_name String?
+  form         String?
+  strength     String?
+
+  current_stock Int @default(0)
+  reorder_level Int @default(50)
+  supplier String?
   normal_price      Int @default(0)
   promotional_price Int @default(0)
   wholesale_price   Int @default(0)
 
-  updated_at    DateTime  @updatedAt
+  created_at   DateTime  @default(now())
+  updated_at   DateTime  @updatedAt
 
   otc_sale_items     OtcSaleItem[]
   prescription_items PrescriptionItem[]
+  order_items        PharmacyOrderItem[]
+  restock_requests   RestockRequest[]
+  movements          StockMovement[]
+  batches ProductBatch[]
 
-  @@map("drug_stock")
+  @@index([category, is_active])
+  @@index([category, name])
+  @@index([category, sub_category])
+  @@index([name])
+  @@map("products")
 }
+
+model ProductBatch {
+  id Int  @id @default(autoincrement())
+  product_id    Int
+  batch_number  Int @default(autoincrement()) @unique
+  expiry_date   DateTime?
+  quantity  Int    @default(0)  
+  received_at   DateTime  @default(now())
+  received_by   String?   
+  notes         String?
+  is_exhausted  Boolean   @default(false) 
+
+  product Product @relation(fields: [product_id], references: [id], onDelete: Cascade)
+
+  @@unique([product_id, batch_number])
+  @@index([product_id, expiry_date])   
+  @@index([product_id, is_exhausted])
+  @@map("product_batches")
+}
+
+model StockMovement {
+  id            Int   @id @default(autoincrement())
+  product_id    Int
+  delta         Int 
+  reason        MovementReason
+  ref_type      String? 
+  ref_id        Int?
+  balance_after Int
+  note          String?
+  staff_id      Int?
+  created_at    DateTime       @default(now())
+
+  product Product @relation(fields: [product_id], references: [id])
+  staff   Staff?  @relation(fields: [staff_id], references: [id], onDelete: SetNull)
+
+  @@index([product_id, created_at])
+  @@index([reason, created_at])
+  @@index([ref_type, ref_id])
+  @@map("stock_movements")
+}
+
+// ─── OTC sales ────────────────────────────────────────────────────────────────
 
 model OtcSale {
   id             Int           @id @default(autoincrement())
-  receipt_number String        @unique // e.g. "OTC-00231"
+  receipt_number String        @unique
   customer_name  String        @default("Walk-in Customer")
   payment_method PaymentMethod @default(cash)
   sold_by_id     Int?
+  subtotal       Int           @default(0) 
+  tax_total      Int           @default(0)
   total          Int           @default(0)
   sold_at        DateTime      @default(now())
+  customer_id   Int?
+  discount_amount Int       @default(0)
+  discount_reason String?
+  discount_by     String?
 
+
+  customer      PharmacyCustomer? @relation(fields: [customer_id], references: [id])
   sold_by_staff Staff?        @relation("OtcSoldBy", fields: [sold_by_id], references: [id])
   items         OtcSaleItem[]
+  payments      OtcSalePayment[]
 
+  @@index([sold_at])
   @@map("otc_sales")
 }
 
 model OtcSaleItem {
   id         Int    @id @default(autoincrement())
   sale_id    Int
-  drug_id    Int?
-  name       String 
+  product_id Int? 
+  name       String
   quantity   Int    @default(1)
-  unit_price Int    @default(0)
-  price_tier String @default("normal") // normal | promotional | wholesale
+  unit_price Int    @default(0) // tax-inclusive, what was charged
+  unit_cost  Int    @default(0) // NEW — snapshot, keeps margin reconstructable
+  tax_amount Int    @default(0) // NEW — tax contained in this line, in total
+  price_tier String @default("normal")
 
-  sale OtcSale    @relation(fields: [sale_id], references: [id], onDelete: Cascade)
-  drug DrugStock? @relation(fields: [drug_id], references: [id], onDelete: SetNull)
+  sale    OtcSale  @relation(fields: [sale_id], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [product_id], references: [id], onDelete: SetNull)
 
+  @@index([sale_id])
+  @@index([product_id])
   @@map("otc_sale_items")
 }
+model PharmacyCustomer {
+  id         Int      @id @default(autoincrement())
+  name       String
+  phone      String?  @unique
+  created_at DateTime @default(now())
+
+  sales     OtcSale[]
+  payments  CustomerPayment[]
+
+  @@map("pharmacy_customers")
+}
+
+
+model OtcSalePayment {
+  id         Int           @id @default(autoincrement())
+  sale_id    Int
+  method     PaymentMethod
+  amount     Int
+  reference  String?
+  created_at DateTime      @default(now())
+
+  sale OtcSale @relation(fields: [sale_id], references: [id], onDelete: Cascade)
+
+  @@index([sale_id])
+  @@map("otc_sale_payments")
+}
+
+
+model CustomerPayment {
+  id          Int      @id @default(autoincrement())
+  customer_id Int
+  amount      Int      // positive = paying down debt
+  method      String   // cash, mpesa, etc.
+  reference   String?
+  staff_id    Int?
+  created_at  DateTime @default(now())
+
+  customer PharmacyCustomer @relation(fields: [customer_id], references: [id])
+  staff    Staff?           @relation(fields: [staff_id], references: [id])
+
+  @@index([customer_id, created_at])
+  @@map("customer_payments")
+}
+
+// ─── Settings / audit / notifications ─────────────────────────────────────────
 
 model ClinicSettings {
-  id                      Int      @id @default(autoincrement())
-  prescription_markup_pct Int      @default(25) // e.g. 25 = 25% markup
-
-  // Clinic profile (ClinicProfileTab)
+  id      Int @id @default(autoincrement())
   name    String?
   tagline String?
   address String?
   phone   String?
   email   String?
 
-  // Admin-editable config slices (JSON)
-  visit_rules       Json? 
-  lab_settings      Json?
-  pharmacy_settings Json? 
-  notifications     Json? 
-  security          Json? 
+  pharmacy_settings Json?
+  security          Json?
 
   updated_at DateTime @updatedAt
 
@@ -495,13 +675,13 @@ model ClinicSettings {
 
 model AuditLog {
   id          Int      @id @default(autoincrement())
-  staff_id    Int?     
-  user        String? 
-  action      String  
-  description String   
-  category    String   
-  entity      String?  
-  entity_id   Int? 
+  staff_id    Int?
+  user        String?
+  action      String
+  description String
+  category    String
+  entity      String?
+  entity_id   Int?
   ip_address  String?
   timestamp   DateTime @default(now())
 
@@ -509,21 +689,24 @@ model AuditLog {
 
   @@index([category])
   @@index([timestamp])
+  @@index([entity, entity_id])
+  @@index([staff_id])
   @@map("audit_log")
 }
 
 model Notification {
-  id       Int      @id @default(autoincrement())
-  staff_id Int?     
-  type     String   
-  title    String
-  message  String
-  is_read  Boolean @default(false)
-  visit_id  Int?
-  target_role Json?
+  id              Int      @id @default(autoincrement())
+  staff_id        Int?
+  type            String
+  title           String
+  message         String
+  is_read         Boolean  @default(false)
+  visit_id        Int?
+  target_role     Json?
   target_staff_id Int?
-  timestamp DateTime @default(now())
+  timestamp       DateTime @default(now())
 
+  @@index([target_staff_id, is_read])
   @@map("notifications")
 }
 
@@ -533,15 +716,21 @@ model Bill {
   id       Int @id @default(autoincrement())
   visit_id Int @unique
 
-  consultation_fee            Int       @default(0)
-  consultation_fee_status     FeeStatus @default(pending)
+  consultation_fee                Int       @default(0)
+  consultation_fee_status         FeeStatus @default(pending)
   consultation_fee_status_paid_at DateTime?
+  consultation_fee_waived_by      String?
+  consultation_fee_waive_reason   String?
+  consultation_fee_waived_at      DateTime?
 
   lab_fee        Int       @default(0)
   medication_fee Int       @default(0)
   procedure_fee  Int       @default(0)
   stage2_status  FeeStatus @default(pending)
   stage2_paid_at DateTime?
+
+  discount_amount Int     @default(0)
+  discount_reason String?
 
   total_amount Int       @default(0)
   fee_status   FeeStatus @default(pending)
@@ -552,6 +741,7 @@ model Bill {
   visit    Visit     @relation(fields: [visit_id], references: [id], onDelete: Cascade)
   payments Payment[]
 
+  @@index([fee_status])
   @@map("bills")
 }
 
@@ -568,9 +758,10 @@ model Payment {
   bill    Bill   @relation(fields: [bill_id], references: [id], onDelete: Cascade)
   cashier Staff? @relation("CashierPayments", fields: [cashier_id], references: [id])
 
+  @@index([bill_id])
+  @@index([paid_at])
   @@map("payments")
 }
-
 
 model ChargeTemplate {
   id         Int            @id @default(autoincrement())
@@ -584,7 +775,7 @@ model ChargeTemplate {
   @@map("charge_templates")
 }
 
-// ─── Pharmacy Financials ──────────────────────────────────────────────────────
+// ─── Pharmacy financials ──────────────────────────────────────────────────────
 
 model PharmacyTransaction {
   id          Int            @id @default(autoincrement())
@@ -605,12 +796,11 @@ model PharmacyExpense {
   recorded_by Int?
   incurred_at DateTime @default(now())
   created_at  DateTime @default(now())
+
   recorded_by_staff Staff? @relation(fields: [recorded_by], references: [id])
 
   @@map("pharmacy_expenses")
 }
-
-// ─── Clinic Expenses ─────────────────────────────────────────────────────────
 
 model ClinicExpense {
   id          Int      @id @default(autoincrement())
@@ -628,49 +818,50 @@ model ClinicExpense {
 
 
 model RestockRequest {
-  id                 Int               @id @default(autoincrement())
-  department         RestockDepartment
-  item_id            Int               // FK to DrugStock or LabStock depending on department
-  item_name          String            // denormalised for display
-  current_stock      Int               @default(0)
-  requested_qty      Int
-  received_qty       Int               @default(0)
-  unit_cost          Int               @default(0)
-  supplier           String?
-  batch_number       String?
-  expiry_date        DateTime?
+  id           Int               @id @default(autoincrement())
+  department   RestockDepartment
+  product_id   Int? // RENAMED from drug_stock_id
+  lab_stock_id Int?
+
+  quantity  Int 
+
+  batch_number String?
+  expiry_date  DateTime?
+
   notes              String?
-  direct_restock     Boolean           @default(false) // true = no verification needed
-  status             RestockStatus     @default(pending)
-  requested_by       String            // staff username
+  status             RestockStatus @default(pending)
+  requested_by       String
+  requested_by_id    Int?
   verified_by        String?
   verified_at        DateTime?
   verification_notes String?
-  requested_at       DateTime          @default(now())
-  updated_at         DateTime          @updatedAt
+  requested_at       DateTime      @default(now())
+  updated_at         DateTime      @updatedAt
 
+  product   Product?  @relation(fields: [product_id], references: [id])
+  lab_stock LabStock? @relation(fields: [lab_stock_id], references: [id])
+
+  @@index([status, department])
+  @@index([product_id, status])
   @@map("restock_requests")
 }
 
-model Referral {
-  id                 Int      @id @default(autoincrement())
-  visit_id           Int      @unique   // one referral per visit
-  referrer_name      String             // Dr. Mwenda
-  referrer_facility  String             // Kenyatta Hospital
-  referrer_phone     String?
-  test_ordered       String             // what test they sent the patient for
-  test_cost          Int                // actual cost charged to patient
-  commission_rate    Float  @default(0.1)  // 0.1 = 10%
-  commission_amount  Int                // test_cost × commission_rate (stored, not computed)
-  status             ReferralStatus @default(pending)
-  notes              String?
-  referred_at        DateTime @default(now())
-  paid_at            DateTime?
-  paid_by            String?            // admin's name who recorded the payment
-  amount_paid        Int?               // actual amount paid (may differ from commission_amount)
+// ─── External referrals ───────────────────────────────────────────────────────
 
-  created_at         DateTime @default(now())
-  updated_at         DateTime @updatedAt
+model Referral {
+  id                Int            @id @default(autoincrement())
+  visit_id          Int            @unique
+  referrer_name     String
+  referrer_facility String?
+  referrer_phone    String?
+  commission_amount Int?
+  status            ReferralStatus @default(pending)
+  notes             String?
+  paid_at           DateTime?
+  paid_by           String?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
 
   visit Visit @relation(fields: [visit_id], references: [id])
 

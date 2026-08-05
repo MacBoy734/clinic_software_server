@@ -1,44 +1,9 @@
-/**
- * controllers/adminController.js
- *
- * All admin endpoints for the clinic system, including the finance/FinanceTab
- * endpoints that used to live in controllers/financeController.js.
- *
- * Sections:
- *   1.  Shared helpers
- *   2.  Overview
- *   3.  Revenue (dashboard chart + full finance report + reports stats)
- *   4.  Patients / Visits report
- *   5.  Staff
- *   6.  Bills (today's billing queue + full finance bills ledger)
- *   7.  Payments (finance ledger)
- *   8.  Lab Requests
- *   9.  Lab Stats
- *   10. Lab Stock
- *   11. Expenses (list / stats / create / delete)
- *   12. Settings
- *   13. Audit Log
- *   14. Sessions
- */
-
 const bcrypt = require('bcryptjs')
 const prisma = require('../lib/prisma')
-const {
-  writeAuditLog,
-  getPeriodRange,
-  todayRange,
-  lastNDays,
-  endOfDay,
-  dayLabel
-} = require('../utils/helpers')
+const { writeAuditLog, getPeriodRange, todayRange, lastNDays, endOfDay, dayLabel, buildDayBuckets, resolveRange, parseDateRange, getPagination} = require('../utils/helpers')
+const { getSettings, invalidateSettings, SETTINGS_ID } = require('../lib/settings')
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 1. ADMIN-SPECIFIC HELPERS  (not generic enough for utils/helpers)
-// ═══════════════════════════════════════════════════════════════════════════════
 
-// getPeriodStart — kept locally because getPatients / getPatientStats use
-// { gte: periodStart } (open-ended) rather than the { gte, lte } range that
-// getPeriodRange returns. Changing those queries would alter their behaviour.
 function getPeriodStart(period) {
   const d = new Date()
   d.setHours(0, 0, 0, 0)
@@ -47,52 +12,6 @@ function getPeriodStart(period) {
   if (period === 'this_month') { d.setDate(1); return d }
   if (period === 'this_year') { d.setMonth(0, 1); return d }
   return d
-}
-
-// monthLabel — only used in this controller for chart axis labels.
-function monthLabel(date) {
-  return date.toLocaleDateString('en-KE', { month: 'short', year: '2-digit' })
-}
-
-// parseDateRangeQuery / daysBetween — used by the custom date-range chart
-// endpoints in section 3. Admin-specific, not needed elsewhere.
-function parseDateRangeQuery(query) {
-  const fallbackDays = lastNDays(7)
-  const fallbackStart = fallbackDays[0]
-  const fallbackEnd = new Date()
-  fallbackEnd.setHours(23, 59, 59, 999)
-
-  const start = query.start ? new Date(query.start) : fallbackStart
-  const end = query.end ? new Date(query.end) : fallbackEnd
-
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
-    return { start: fallbackStart, end: fallbackEnd }
-  }
-
-  start.setHours(0, 0, 0, 0)
-  end.setHours(23, 59, 59, 999)
-  return { start, end }
-}
-
-function daysBetween(start, end) {
-  const days = []
-  const cursor = new Date(start)
-  cursor.setHours(0, 0, 0, 0)
-  while (cursor <= end) {
-    days.push(new Date(cursor))
-    cursor.setDate(cursor.getDate() + 1)
-  }
-  return days
-}
-
-// FIXED: was `prisma.settings` — that model doesn't exist in the schema.
-// The clinic-wide config singleton is `ClinicSettings` (id: 1).
-async function getOrCreateSettings() {
-  let settings = await prisma.clinicSettings.findFirst()
-  if (!settings) {
-    settings = await prisma.clinicSettings.create({ data: { id: 1 } })
-  }
-  return settings
 }
 
 function shapeExpense(e, domain) {
@@ -108,11 +27,7 @@ function shapeExpense(e, domain) {
   }
 }
 
-// FIXED: test_name / result / unit_cost live on LabRequestItem, not
-// LabRequest, since the RESTRUCTURED schema split one-request-per-test into
-// one-order-group (LabRequest) with many test items (LabRequestItem). Pull
-// them through the `items` relation instead of selecting them directly off
-// LabRequest.
+
 const VISIT_INCLUDE = {
   doctor: { select: { username: true } },
   bill: true,
@@ -140,26 +55,21 @@ const VISIT_INCLUDE = {
 
 function shapeReferral(r) {
   return {
-    id:                r.id,
-    visit_id:          r.visit_id,
-    status:            r.status,
-    referrer_name:     r.referrer_name,
-    referrer_phone:    r.referrer_phone ?? null,
-    patient_name:      r.visit?.patient?.name ?? '—',
-    test_ordered:      r.test_ordered,
-    test_cost:         r.test_cost,
-    commission_rate:   r.commission_rate,
-    commission_amount: r.commission_amount,
-    notes:             r.notes ?? null,
-    referred_at:       r.referred_at,
-    paid_at:           r.paid_at ?? null,
-    paid_by:           r.paid_by ?? null,
-    amount_paid:       r.amount_paid ?? null,
+    id: r.id,
+    visit_id: r.visit_id,
+    status: r.status,
+    referrer_name: r.referrer_name,
+    referrer_phone: r.referrer_phone ?? null,
+    patient_name: r.visit?.patient?.name,
+    test_ordered: r.test_ordered,
+    notes: r.notes ?? null,
+    referred_at: r.created_at,
+    paid_at: r.paid_at ?? null,
+    paid_by: r.paid_by ?? null,
+    amount_paid: r.commission_amount ?? null,
   }
 }
 
-// Flattens LabRequest -> items into one row per test, matching the shape
-// the frontend expects (test_name directly on each lab_requests entry).
 function flattenLabRequests(labRequests) {
   return labRequests.flatMap(lr =>
     lr.items.map(item => ({
@@ -176,10 +86,6 @@ function flattenLabRequests(labRequests) {
   )
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 2. OVERVIEW
-// ═══════════════════════════════════════════════════════════════════════════════
-
 module.exports.getAdminOverview = async (req, res) => {
   const today = new Date()
   today.setHours(0, 0, 0, 0)
@@ -190,7 +96,7 @@ module.exports.getAdminOverview = async (req, res) => {
       paymentsToday,
       allBills,
       activeStaff,
-      allDrugStock,
+      allProducts,
       allLabStock,
       recentPayments,
       recentVisits,
@@ -224,7 +130,7 @@ module.exports.getAdminOverview = async (req, res) => {
         select: { id: true, username: true, role: true },
         orderBy: { role: 'asc' },
       }),
-      prisma.drugStock.findMany({
+      prisma.product.findMany({
         select: { id: true, name: true, current_stock: true, reorder_level: true, unit: true },
       }),
       prisma.labStock.findMany({
@@ -281,7 +187,7 @@ module.exports.getAdminOverview = async (req, res) => {
       active_visits: activeVisitsByDoctor[s.id] || 0,
     }))
 
-    const lowDrugs = allDrugStock
+    const lowDrugs = allProducts
       .filter(d => d.current_stock <= d.reorder_level)
       .map(d => ({ ...d, alert: d.current_stock === 0 ? 'out_of_stock' : 'low_stock' }))
 
@@ -347,12 +253,6 @@ module.exports.getAdminOverview = async (req, res) => {
     return res.status(500).json({ error: 'Failed to load overview' })
   }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// 3. REVENUE / REPORTS STATS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// GET /api/admin/revenue/week — lightweight 7-day chart used on the dashboard
 module.exports.getRevenueWeek = async (req, res) => {
   try {
     const days = lastNDays(7)
@@ -393,14 +293,6 @@ module.exports.getRevenueWeek = async (req, res) => {
     return res.status(500).json({ error: 'Failed to fetch revenue data' })
   }
 }
-
-// GET /api/admin/finance/revenue?period=this_month — full FinanceTab revenue report
-//
-// Revenue sources:
-//   Clinic revenue   = payments on Bills (consultation, lab, procedure fees)
-//   Pharmacy revenue = OtcSale totals (walk-in pharmacy sales)
-//
-// Net Income = (clinic_revenue + pharmacy_revenue) - (clinic_expenses + pharmacy_expenses)
 module.exports.getRevenueReport = async (req, res) => {
   try {
     const period = req.query.period || 'this_month'
@@ -521,380 +413,328 @@ module.exports.getRevenueReport = async (req, res) => {
     return res.status(500).json({ error: 'Failed to fetch revenue report' })
   }
 }
-
-// GET /api/admin/stats?period= — used by ReportsTab's Revenue + Visits sub-tabs
-module.exports.getAdminRevenueReport = async (req, res) => {
+module.exports.getLabReport = async (req, res) => {
   try {
-    const period = req.query.period || 'this_month'
-    const range = getPeriodRange(period)
-
-    const visits = await prisma.visit.findMany({
-      where: { arrived_at: range },
-      select: {
-        id: true,
-        visit_type: true,
-        status: true,
-        arrived_at: true,
-      },
-    })
-
-    const payments = await prisma.payment.findMany({
-      where: { paid_at: range },
-      select: { amount: true, method: true },
-    })
-
-    const total_visits = visits.length
-
-    const msInDay = 24 * 60 * 60 * 1000
-    const daysInPeriod = Math.max(
-      1,
-      Math.ceil((range.lte.getTime() - range.gte.getTime()) / msInDay),
-    )
-    const avg_per_day = total_visits > 0
-      ? Math.round((total_visits / daysInPeriod) * 10) / 10
-      : 0
-
-    const doneCount = visits.filter(v => v.status === 'done').length
-    const completion_rate = total_visits > 0
-      ? Math.round((doneCount / total_visits) * 100)
-      : 0
-
-    const by_visit_type = {}
-    for (const v of visits) {
-      by_visit_type[v.visit_type] = (by_visit_type[v.visit_type] || 0) + 1
+    const { start, end, days } = resolveRange(req.query)
+    const where = { requested_at: { gte: start, lte: end } }
+ 
+    const [labRequests, items] = await Promise.all([
+      prisma.labRequest.findMany({
+        where,
+        select: { id: true, requested_at: true, completed_at: true },
+      }),
+      prisma.labRequestItem.findMany({
+        where: { lab_request: where },
+        select: { test_name: true },
+      }),
+    ])
+ 
+    const total = labRequests.length
+ 
+    // ── by_day (grouped by LabRequest.requested_at) ────────────────────────
+    const dayBuckets = buildDayBuckets(start, days)
+    const bucketByKey = Object.fromEntries(dayBuckets.map((b) => [b.key, b]))
+    for (const lr of labRequests) {
+      const key = new Date(lr.requested_at).toDateString()
+      if (bucketByKey[key]) bucketByKey[key].count++
     }
-
-    const most_common_type = Object.entries(by_visit_type)
-      .sort((a, b) => b[1] - a[1])[0]?.[0] ?? null
-
-    const total_revenue = payments.reduce((s, p) => s + p.amount, 0)
-
-    const by_payment_method = { cash: 0, mpesa: 0, insurance: 0, other: 0 }
-    for (const p of payments) {
-      const m = p.method || 'other'
-      by_payment_method[m] = (by_payment_method[m] || 0) + p.amount
-    }
-
-    const chartDays = lastNDays(7)
-    const by_day = chartDays.map(day => {
-      const dayEnd = endOfDay(day)
-      const count = visits.filter(v => {
-        const t = new Date(v.arrived_at)
-        return t >= day && t <= dayEnd
-      }).length
-      return { day: dayLabel(day), count }
-    })
-
-    const by_status = {}
-    for (const v of visits) {
-      by_status[v.status] = (by_status[v.status] || 0) + 1
-    }
-
+    const by_day = dayBuckets.map(({ day, count }) => ({ day, count }))
+ 
+    // ── avg_turnaround_hours (only requests completed within the range) ───
+    const completed = labRequests.filter((lr) => lr.completed_at)
+    const avg_turnaround_hours =
+      completed.length > 0
+        ? Math.round(
+            (completed.reduce(
+              (sum, lr) =>
+                sum + (new Date(lr.completed_at) - new Date(lr.requested_at)),
+              0
+            ) /
+              completed.length /
+              (1000 * 60 * 60)) *
+              10
+          ) / 10
+        : 0
+ 
+    // ── top_tests / most_ordered (grouped by LabRequestItem.test_name) ─────
+    const testCounts = items.reduce((acc, item) => {
+      acc[item.test_name] = (acc[item.test_name] || 0) + 1
+      return acc
+    }, {})
+    const top_tests = Object.entries(testCounts)
+      .map(([name, count]) => ({ name, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10)
+    const most_ordered = top_tests[0]?.name ?? '—'
+ 
     return res.json({
-      period,
+      stats: { total },
+      by_day,
+      top_tests,
+      avg_turnaround_hours,
+      most_ordered,
+    })
+  } catch (err) {
+    console.error('[admin] getLabReport:', err.message)
+    if (err.message === 'Invalid custom date range') {
+      return res.status(400).json({ error: 'Invalid start/end date' })
+    }
+    return res.status(500).json({ error: 'Failed to fetch lab report' })
+  }
+}
+
+module.exports.getAdminVisitsReport = async (req, res) => {
+  try {
+    const DAYS = 7
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+ 
+    const start = new Date(today)
+    start.setDate(start.getDate() - (DAYS - 1)) 
+ 
+    const end = new Date(today)
+    end.setHours(23, 59, 59, 999)
+ 
+    const where = { arrived_at: { gte: start, lte: end } }
+ 
+    const [visits, byTypeGroups] = await Promise.all([
+      prisma.visit.findMany({
+        where,
+        select: { id: true, status: true, visit_type: true, arrived_at: true },
+      }),
+      prisma.visit.groupBy({
+        by: ['visit_type'],
+        where,
+        _count: { _all: true },
+      }),
+    ])
+ 
+    const total_visits = visits.length
+ 
+    // ── by_visit_type ──────────────────────────────────────────────────────
+    const by_visit_type = byTypeGroups.reduce((acc, g) => {
+      acc[g.visit_type] = g._count._all
+      return acc
+    }, {})
+ 
+    // ── most_common_type ───────────────────────────────────────────────────
+    const most_common_type = byTypeGroups
+      .slice()
+      .sort((a, b) => b._count._all - a._count._all)[0]?.visit_type ?? '—'
+ 
+    // ── by_day (fixed 7-day window, oldest -> newest) ──────────────────────
+    const dayBuckets = []
+    for (let i = 0; i < DAYS; i++) {
+      const d = new Date(start)
+      d.setDate(start.getDate() + i)
+      dayBuckets.push({
+        key: d.toDateString(),
+        day: d.toLocaleDateString('en-US', { weekday: 'short' }),
+        count: 0,
+      })
+    }
+    const bucketByKey = Object.fromEntries(dayBuckets.map((b) => [b.key, b]))
+    for (const v of visits) {
+      const key = new Date(v.arrived_at).toDateString()
+      if (bucketByKey[key]) bucketByKey[key].count++
+    }
+    const by_day = dayBuckets.map(({ day, count }) => ({ day, count }))
+ 
+    // ── avg_per_day ─────────────────────────────────────────────────────────
+    const avg_per_day = Math.round(total_visits / DAYS)
+ 
+    // ── completion_rate ──────────────────────────────────────────────────────
+    const completedCount = visits.filter(
+      (v) => v.status === 'done' || v.status === 'archived'
+    ).length
+    const completion_rate =
+      total_visits > 0 ? Math.round((completedCount / total_visits) * 100) : 0
+ 
+    return res.json({
       stats: {
         total_visits,
         avg_per_day,
         most_common_type,
         completion_rate,
-        done_count: doneCount,
-        total_revenue,
-        by_payment_method,
       },
       by_day,
       by_visit_type,
-      by_status,
     })
   } catch (err) {
-    console.error('[adminStats] getAdminRevenueReport:', err.message)
+    console.error('[admin] getAdminStats:', err.message)
     return res.status(500).json({ error: 'Failed to fetch admin stats' })
   }
 }
 
-// GET /api/admin/visits?period=&status=&visit_type=&fee_status=&search=&page=&limit=
-module.exports.getAdminVisitsReport = async (req, res) => {
-  const {
-    period = 'today',
-    status,
-    visit_type,
-    fee_status,
-    search,
-    page = '1',
-    limit = '20',
-  } = req.query
-
-  const skip = (parseInt(page) - 1) * parseInt(limit)
-  const range = getPeriodRange(period)
-
-  const where = { arrived_at: range }
-
-  if (status && status !== 'all') where.status = status
-  if (visit_type && visit_type !== 'all') where.visit_type = visit_type
-  if (fee_status && fee_status !== 'all') where.bill = { fee_status }
-
-  if (search && search.trim()) {
-    const q = search.trim()
-    where.patient = {
-      OR: [
-        { name: { contains: q, mode: 'insensitive' } },
-        { phone: { contains: q, mode: 'insensitive' } },
-        { national_id: { contains: q, mode: 'insensitive' } },
-      ],
-    }
-  }
-
+module.exports.getPharmacyReport = async (req, res) => {
   try {
-    const [visits, total] = await Promise.all([
-      prisma.visit.findMany({
-        where,
-        skip,
-        take: parseInt(limit),
-        orderBy: { arrived_at: 'desc' },
-        include: {
-          patient: {
-            select: {
-              id: true,
-              name: true,
-              age: true,
-              gender: true,
-              phone: true,
-              national_id: true,
-              blood_group: true,
-              allergies: true,
-            },
-          },
-
-          doctor: {
-            select: { id: true, username: true },
-          },
-
-          bill: {
-            include: {
-              payments: {
-                select: {
-                  id: true,
-                  amount: true,
-                  method: true,
-                  stage: true,
-                  paid_at: true,
-                },
-                orderBy: { paid_at: 'asc' },
-              },
-            },
-          },
-
-          // FIXED: schema has test_name/result/unit_cost on LabRequestItem,
-          // not LabRequest — pull through the `items` relation.
-          lab_requests: {
-            include: {
-              items: {
-                select: {
-                  id: true,
-                  test_name: true,
-                  status: true,
-                  result: true,
-                  unit_cost: true,
-                },
-              },
-            },
-          },
-
-          prescriptions: {
-            include: {
-              items: {
-                select: {
-                  id: true,
-                  drug_name: true,
-                  dosage: true,
-                  frequency: true,
-                  duration: true,
-                  quantity: true,
-                  unit_cost: true,
-                },
-                orderBy: { id: 'asc' },
-              },
-            },
-            orderBy: { created_at: 'asc' },
-          },
-        },
-      }),
-
-      prisma.visit.count({ where }),
-    ])
-
-    const [allVisits, revenueResult] = await Promise.all([
-      prisma.visit.findMany({
-        where,
+    const { start, end, days } = resolveRange(req.query)
+ 
+    const [dispensedPrescriptions, otcSales, expenseAgg] = await Promise.all([
+      // "Dispensed" = the prescription itself was handed out to the patient
+      prisma.prescription.findMany({
+        where: { dispensed_at: { gte: start, lte: end } },
         select: {
           id: true,
-          status: true,
-          referred_by: true,
-          bill: { select: { fee_status: true, total_amount: true } },
+          dispensed_at: true,
+          items: {
+            select: { drug_name: true, quantity: true, status: true },
+          },
         },
       }),
-      prisma.payment.aggregate({
-        where: { paid_at: range, bill: { visit: { arrived_at: range } } },
+      prisma.otcSale.findMany({
+        where: { sold_at: { gte: start, lte: end } },
+        select: {
+          id: true,
+          sold_at: true,
+          items: { select: { name: true, quantity: true } },
+        },
+      }),
+      prisma.pharmacyExpense.aggregate({
+        where: { incurred_at: { gte: start, lte: end } },
         _sum: { amount: true },
       }),
     ])
-
-    const stats = {
-      total_visits: allVisits.length,
-      completed: allVisits.filter(v => v.status === 'done' || v.status === 'archived').length,
-      pending_payment: allVisits.filter(v => v.bill?.fee_status === 'pending').length,
-      total_revenue: revenueResult._sum.amount ?? 0,
-      referred_count: allVisits.filter(v => !!v.referred_by).length,
-    }
-
-    const shaped = visits.map(v => ({
-      id: v.id,
-      queue_number: v.queue_number ?? null,
-      visit_type: v.visit_type,
-      status: v.status,
-      arrived_at: v.arrived_at,
-      // NOTE: Visit has no `completed_at` column in the schema — this will
-      // always be null. Completion is tracked via status === 'done' instead.
-      completed_at: null,
-      referred_by: v.referred_by ?? null,
-      referrer_phone: v.referrer_phone ?? null,
-      diagnosis: v.diagnosis ?? null,
-      notes: v.notes ?? null,
-
-      patient: v.patient ? {
-        id: v.patient.id,
-        name: v.patient.name,
-        age: v.patient.age ?? null,
-        gender: v.patient.gender ?? null,
-        phone: v.patient.phone ?? null,
-        national_id: v.patient.national_id ?? null,
-        blood_group: v.patient.blood_group ?? null,
-        allergies: v.patient.allergies ?? null,
-      } : null,
-
-      doctor: v.doctor ? {
-        id: v.doctor.id,
-        username: v.doctor.username,
-      } : null,
-
-      bill: v.bill ? {
-        id: v.bill.id,
-        consultation_fee: v.bill.consultation_fee,
-        consultation_fee_status: v.bill.consultation_fee_status,
-        lab_fee: v.bill.lab_fee,
-        medication_fee: v.bill.medication_fee,
-        procedure_fee: v.bill.procedure_fee,
-        total_amount: v.bill.total_amount,
-        fee_status: v.bill.fee_status,
-        stage2_status: v.bill.stage2_status ?? null,
-        payments: v.bill.payments.map(p => ({
-          id: p.id,
-          amount: p.amount,
-          method: p.method,
-          stage: p.stage,
-          paid_at: p.paid_at,
-        })),
-      } : null,
-
-      lab_requests: flattenLabRequests(v.lab_requests),
-
-      prescriptions: v.prescriptions.map(rx => ({
-        id: rx.id,
-        status: rx.status,
-        dispensed_at: rx.dispensed_at ?? null,
-        notes: rx.notes ?? null,
-        items: rx.items.map(item => ({
-          id: item.id,
-          drug_name: item.drug_name,
-          dosage: item.dosage ?? null,
-          frequency: item.frequency ?? null,
-          duration: item.duration ?? null,
-          quantity: item.quantity ?? null,
-          unit_cost: item.unit_cost ?? 0,
-        })),
-      })),
+ 
+    const dispensed_total = dispensedPrescriptions.length
+    const otc_total = otcSales.length
+    const expenses_total = expenseAgg._sum.amount ?? 0
+ 
+    // ── by_day: dispensed (by Prescription.dispensed_at) + otc (by OtcSale.sold_at)
+    const dayBuckets = buildDayBuckets(start, days).map((b) => ({
+      ...b,
+      dispensed: 0,
+      otc: 0,
     }))
-
+    const bucketByKey = Object.fromEntries(dayBuckets.map((b) => [b.key, b]))
+ 
+    for (const rx of dispensedPrescriptions) {
+      const key = new Date(rx.dispensed_at).toDateString()
+      if (bucketByKey[key]) bucketByKey[key].dispensed++
+    }
+    for (const sale of otcSales) {
+      const key = new Date(sale.sold_at).toDateString()
+      if (bucketByKey[key]) bucketByKey[key].otc++
+    }
+    const by_day = dayBuckets.map(({ day, dispensed, otc }) => ({
+      day,
+      dispensed,
+      otc,
+    }))
+ 
+    // ── top_drugs: merge quantities from issued prescription items + OTC sale items
+    const drugCounts = {}
+ 
+    for (const rx of dispensedPrescriptions) {
+      for (const item of rx.items) {
+        if (item.status !== 'issued') continue // skip declined/returned/pending lines
+        drugCounts[item.drug_name] =
+          (drugCounts[item.drug_name] || 0) + (item.quantity || 0)
+      }
+    }
+    for (const sale of otcSales) {
+      for (const item of sale.items) {
+        drugCounts[item.name] = (drugCounts[item.name] || 0) + (item.quantity || 0)
+      }
+    }
+ 
+    const top_drugs = Object.entries(drugCounts)
+      .map(([name, count]) => ({ name, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10)
+ 
     return res.json({
-      visits: shaped,
-      total,
-      page: parseInt(page),
-      limit: parseInt(limit),
-      stats,
+      stats: { dispensed_total, otc_total, expenses_total },
+      by_day,
+      top_drugs,
     })
   } catch (err) {
-    console.error('[admin] getAdminVisitsReport:', err.message)
-    return res.status(500).json({ error: 'Failed to fetch visits' })
+    console.error('[admin] getPharmacyReport:', err.message)
+    if (err.message === 'Invalid custom date range') {
+      return res.status(400).json({ error: 'Invalid start/end date' })
+    }
+    return res.status(500).json({ error: 'Failed to fetch pharmacy report' })
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 4. PATIENTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// GET /api/admin/patients?page=&limit=&period=&visit_type=&fee_status=&gender=&search=
 module.exports.getPatients = async (req, res) => {
-  const {
-    page = 1,
-    limit = 20,
-    period = 'this_month',
-    visit_type,
-    fee_status,
-    gender,
-    search,
-  } = req.query
-
-  const skip = (Number(page) - 1) * Number(limit)
-  const periodStart = getPeriodStart(period)
-
-  const patientWhere = {}
-  if (gender && gender !== 'all') patientWhere.gender = gender
-  if (search) {
-    patientWhere.OR = [
-      { name: { contains: search, mode: 'insensitive' } },
-      { phone: { contains: search, mode: 'insensitive' } },
-      { national_id: { contains: search, mode: 'insensitive' } },
-    ]
-  }
-
-  const visitWhere = { arrived_at: { gte: periodStart } }
-  if (visit_type && visit_type !== 'all') visitWhere.visit_type = visit_type
-  if (fee_status && fee_status !== 'all') visitWhere.bill = { fee_status }
-
-  patientWhere.visits = { some: visitWhere }
-
   try {
+    const page = Math.max(1, parseInt(req.query.page) || 1)
+    const limit = Math.min(100, parseInt(req.query.limit) || 20)
+    const skip = (page - 1) * limit
+    const period = req.query.period || 'this_month'
+    const periodStart = getPeriodStart(period)
+
+    const visit_type = req.query.visit_type
+    const fee_status = req.query.fee_status
+    const gender = req.query.gender
+    const search = (req.query.search || '').trim()
+
+    // 1. Find all visits in the period (filtered by visit_type)
+    const visitWhere = { arrived_at: { gte: periodStart } }
+    if (visit_type && visit_type !== 'all') visitWhere.visit_type = visit_type
+
+    const matchingVisits = await prisma.visit.findMany({
+      where: visitWhere,
+      select: {
+        id: true, patient_id: true, arrived_at: true,
+        visit_type: true, diagnosis: true,
+      },
+      orderBy: { arrived_at: 'desc' },
+    })
+
+    const patientIdsWithVisits = [...new Set(matchingVisits.map(v => v.patient_id))]
+
+    // 2. Filter patients by gender / search
+    const patientWhere = { id: { in: patientIdsWithVisits } }
+    if (gender && gender !== 'all') patientWhere.gender = gender
+    if (search) {
+      patientWhere.OR = [
+        { name: { contains: search, mode: 'insensitive' } },
+        { phone: { contains: search, mode: 'insensitive' } },
+        { national_id: { contains: search, mode: 'insensitive' } },
+      ]
+    }
+
     const [patients, total] = await Promise.all([
       prisma.patient.findMany({
         where: patientWhere,
         skip,
-        take: Number(limit),
+        take: limit,
         orderBy: { updated_at: 'desc' },
-        include: {
-          visits: {
-            where: visitWhere,
-            orderBy: { arrived_at: 'desc' },
-            take: 1,
-            include: { bill: { select: { fee_status: true, total_amount: true } } },
-          },
-          _count: { select: { visits: true } },
+        select: {
+          id: true, name: true, age: true, gender: true,
+          phone: true, national_id: true, blood_group: true, allergies: true,
         },
       }),
       prisma.patient.count({ where: patientWhere }),
     ])
 
-    const shaped = await Promise.all(patients.map(async (p) => {
-      const lastVisit = p.visits[0] ?? null
+    // 3. Get all bills for these visits in ONE query
+    const visitIds = matchingVisits.map(v => v.id)
+    const bills = await prisma.bill.findMany({
+      where: { visit_id: { in: visitIds } },
+      select: { visit_id: true, total_amount: true, fee_status: true },
+    })
+    const billMap = new Map(bills.map(b => [b.visit_id, b]))
 
-      const bills = await prisma.bill.findMany({
-        where: { visit: { patient_id: p.id, arrived_at: { gte: periodStart } } },
-        select: { total_amount: true, fee_status: true },
-      })
+    // 4. Build last-visit map & bill aggregates per patient
+    const lastVisitMap = new Map()
+    const billAgg = {}
+    for (const v of matchingVisits) {
+      if (!lastVisitMap.has(v.patient_id)) lastVisitMap.set(v.patient_id, v)
+      const b = billMap.get(v.id)
+      if (!b) continue
+      if (!billAgg[v.patient_id]) billAgg[v.patient_id] = { total: 0, unpaid: 0 }
+      billAgg[v.patient_id].total += b.total_amount || 0
+      if (b.fee_status === 'pending') billAgg[v.patient_id].unpaid += b.total_amount || 0
+    }
 
-      const totalBilled = bills.reduce((s, b) => s + (b.total_amount ?? 0), 0)
-      const unpaidBalance = bills
-        .filter(b => b.fee_status === 'pending')
-        .reduce((s, b) => s + (b.total_amount ?? 0), 0)
-
+    // 5. Shape
+    let shaped = patients.map(p => {
+      const last = lastVisitMap.get(p.id)
+      const agg = billAgg[p.id] || { total: 0, unpaid: 0 }
+      const visitCount = matchingVisits.filter(v => v.patient_id === p.id).length
       return {
         id: p.id,
         name: p.name,
@@ -904,23 +744,32 @@ module.exports.getPatients = async (req, res) => {
         national_id: p.national_id,
         blood_group: p.blood_group,
         allergies: p.allergies,
-        total_visits: p._count.visits,
-        last_visit_date: lastVisit?.arrived_at ?? null,
-        last_visit_type: lastVisit?.visit_type ?? null,
-        last_diagnosis: lastVisit?.diagnosis ?? null,
-        total_billed: totalBilled,
-        unpaid_balance: unpaidBalance,
+        total_visits: visitCount,
+        last_visit_date: last?.arrived_at ?? null,
+        last_visit_type: last?.visit_type ?? null,
+        last_diagnosis: last?.diagnosis ?? null,
+        total_billed: agg.total,
+        unpaid_balance: agg.unpaid,
       }
-    }))
+    })
 
-    return res.json({ patients: shaped, total, page: Number(page), limit: Number(limit) })
+    // 6. Apply fee_status filter (must happen after aggregation)
+    if (fee_status && fee_status !== 'all') {
+      shaped = shaped.filter(p => {
+        if (fee_status === 'paid') return p.unpaid_balance === 0 && p.total_billed > 0
+        if (fee_status === 'pending') return p.unpaid_balance > 0
+        if (fee_status === 'waived') return false // track separately if needed
+        return true
+      })
+    }
+
+    return res.json({ patients: shaped, total, page, limit })
   } catch (err) {
-    console.error('getPatients:', err)
+    console.error('getPatients error:', err)
     return res.status(500).json({ error: 'Failed to fetch patients' })
   }
 }
 
-// GET /api/admin/patients/stats?period=
 module.exports.getPatientStats = async (req, res) => {
   const { period = 'this_month' } = req.query
   const periodStart = getPeriodStart(period)
@@ -959,85 +808,122 @@ module.exports.getPatientStats = async (req, res) => {
   }
 }
 
-// GET /api/admin/patients/:id
+module.exports.getPatientInsights = async (req, res) => {
+  try {
+    const period = req.query.period || 'this_month'
+    const periodStart = getPeriodStart(period)
+
+    const records = await prisma.visit.findMany({
+      where: {
+        arrived_at: { gte: periodStart },
+        status: { in: ['done', 'archived', 'with_doctor', 'billing'] },
+      },
+      select: {
+        patient_id: true,
+        visit_type: true,
+        diagnosis_code: true,
+        diagnosis: true,
+        arrived_at: true,
+        patient: {
+          select: { gender: true, age: true, allergies: true },
+        },
+      },
+      orderBy: { arrived_at: 'desc' },
+    })
+
+    const shaped = records.map(r => ({
+      patient_id: r.patient_id,
+      patient_gender: r.patient.gender,
+      patient_age: r.patient.age,
+      allergies: r.patient.allergies,
+      diagnosis_code: r.diagnosis_code,
+      diagnosis: r.diagnosis,
+      visit_type: r.visit_type,
+      arrived_at: r.arrived_at,
+    }))
+
+    return res.json({ records: shaped })
+  } catch (err) {
+    console.error('getPatientInsights error:', err)
+    return res.status(500).json({ error: 'Failed to load insights' })
+  }
+}
+
 module.exports.getPatientDetail = async (req, res) => {
   const { id } = req.params
+  if (!id) {
+    return res.status(400).json({ error: 'Patient ID is required' })
+  }
+
+  const patientId = parseInt(id, 10)
+  if (isNaN(patientId)) {
+    return res.status(400).json({ error: 'Invalid patient ID' })
+  }
 
   try {
     const patient = await prisma.patient.findUnique({
-      where: { id: Number(id) },
+      where: { id: patientId },
       include: {
         visits: {
           orderBy: { arrived_at: 'desc' },
-          include: { ...VISIT_INCLUDE, vitals: true },
-          // VISIT_INCLUDE MUST include: bill { include: { payments: true } }
+          include: {
+            doctor: { select: { username: true } },
+            bill: {
+              include: {
+                payments: {
+                  select: {
+                    id: true, amount: true, method: true,
+                    reference: true, stage: true, paid_at: true,
+                  },
+                },
+              },
+            },
+            lab_requests: {
+              select: {
+                id: true, status: true, notes: true,
+                urgency: true, requested_at: true, completed_at: true,
+                items: {
+                  select: {
+                    id: true, test_name: true, status: true,
+                    result: true, unit_cost: true, reference_range: true, flagged: true,
+                  },
+                },
+              },
+            },
+            prescriptions: {
+              include: {
+                items: {
+                  select: {
+                    id: true, drug_name: true, dosage: true,
+                    frequency: true, duration: true, quantity: true, unit_cost: true,
+                  },
+                },
+              },
+            },
+            vitals: true,
+          },
         },
       },
     })
 
-    if (!patient) return res.status(404).json({ error: 'Patient not found' })
-
-    const visits = patient.visits
-    const num = n => Number(n ?? 0)
-
-    // Normalize bill so paid_amount/balance exist even if not stored as columns.
-    const billView = b => {
-      if (!b) return null
-      const paid = b.paid_amount != null
-        ? num(b.paid_amount)
-        : (b.payments ?? []).reduce((s, p) => s + num(p.amount), 0)
-      const balance = b.balance != null
-        ? num(b.balance)
-        : Math.max(0, num(b.total_amount) - paid)
-      return { ...b, paid_amount: paid, balance }
+    if (!patient) {
+      return res.status(404).json({ error: 'Patient not found' })
     }
 
-    // Flatten labs once; reuse for payload and summary.
-    const visitLabs  = visits.map(v => flattenLabRequests(v.lab_requests))
-    const allLabItems = visitLabs.flatMap(reqs => reqs.flatMap(r => r.items ?? []))
+    const num = n => Number(n ?? 0)
 
-    const bills        = visits.map(v => billView(v.bill)).filter(Boolean)
-    const total_billed = bills.reduce((s, b) => s + num(b.total_amount), 0)
-    const total_paid   = bills.reduce((s, b) => s + b.paid_amount, 0)
+    const total_visits = patient.visits.length
+    const total_billed = patient.visits.reduce((s, v) => s + num(v.bill?.total_amount), 0)
+    const total_paid = patient.visits.reduce((s, v) => {
+      return s + (v.bill?.payments?.reduce((ps, p) => ps + num(p.amount), 0) || 0)
+    }, 0)
+    const unpaid_balance = Math.max(0, total_billed - total_paid)
 
-    return res.json({
-      patient: {
-        id: patient.id,
-        name: patient.name,
-        age: patient.age,
-        gender: patient.gender,
-        phone: patient.phone,
-        national_id: patient.national_id,
-        blood_group: patient.blood_group,
-        allergies: patient.allergies,
-        created_at: patient.created_at,
-      },
-      financial_summary: {
-        total_billed,
-        total_paid,
-        unpaid_balance: Math.max(0, total_billed - total_paid),
-        by_category: {
-          consultation: bills.reduce((s, b) => s + num(b.consultation_fee), 0),
-          lab:          bills.reduce((s, b) => s + num(b.lab_fee), 0),
-          medication:   bills.reduce((s, b) => s + num(b.medication_fee), 0),
-          procedure:    bills.reduce((s, b) => s + num(b.procedure_fee), 0),
-        },
-      },
-      lab_summary: {
-        total_tests:   allLabItems.length,
-        tests_ready:   allLabItems.filter(i => i.status === 'ready').length,
-        tests_pending: allLabItems.filter(i => i.status !== 'ready').length,
-        tests_flagged: allLabItems.filter(i => i.flagged).length,
-      },
-      visit_summary: {
-        total: visits.length,
-        last_visit: visits[0]?.arrived_at ?? null,
-        by_type: visits.reduce((acc, v) => {
-          acc[v.visit_type] = (acc[v.visit_type] ?? 0) + 1
-          return acc
-        }, {}),
-      },
-      visits: visits.map((v, idx) => ({
+    const visits = patient.visits.map(v => {
+      const bill = v.bill
+      const paid_amount = bill?.payments?.reduce((s, p) => s + num(p.amount), 0) || 0
+
+      return {
         id: v.id,
         queue_number: v.queue_number,
         visit_type: v.visit_type,
@@ -1053,32 +939,57 @@ module.exports.getPatientDetail = async (req, res) => {
         notes: v.notes,
         referred_by: v.referred_by,
         referrer_phone: v.referrer_phone,
-        has_lab_results: (visitLabs[idx] ?? []).some(r => (r.items ?? []).some(i => i.status === 'ready')),
         doctor: v.doctor ? { username: v.doctor.username } : null,
-        vitals: v.vitals ?? null,
-        bill: billView(v.bill),
-        lab_requests: visitLabs[idx],
-        prescriptions: v.prescriptions.map(rx => ({
+        vitals: v.vitals,
+        bill: bill ? {
+          id: bill.id,
+          consultation_fee: bill.consultation_fee,
+          consultation_fee_status: bill.consultation_fee_status,
+          lab_fee: bill.lab_fee,
+          medication_fee: bill.medication_fee,
+          procedure_fee: bill.procedure_fee,
+          stage2_status: bill.stage2_status,
+          total_amount: bill.total_amount,
+          fee_status: bill.fee_status,
+          paid_amount,
+          balance: Math.max(0, bill.total_amount - paid_amount),
+          payments: bill.payments || [],
+        } : null,
+        lab_requests: v.lab_requests || [],
+        prescriptions: (v.prescriptions || []).map(rx => ({
           id: rx.id,
           status: rx.status,
           notes: rx.notes,
           created_at: rx.created_at,
           dispensed_at: rx.dispensed_at,
-          prescribed_by: rx.prescriber?.username ?? null,
-          pharmacist:    rx.pharmacist?.username ?? null,
-          items: rx.items,
+          prescribed_by: rx.prescribed_by,
+          items: rx.items || [],
         })),
-      })),
+      }
+    })
+
+    // Flat response — exactly what the slide-over expects
+    return res.json({
+      id: patient.id,
+      name: patient.name,
+      age: patient.age,
+      gender: patient.gender,
+      phone: patient.phone,
+      national_id: patient.national_id,
+      blood_group: patient.blood_group,
+      allergies: patient.allergies,
+      created_at: patient.created_at,
+      total_visits,
+      total_billed,
+      unpaid_balance,
+      visits,
     })
   } catch (err) {
-    console.error('getPatientDetail:', err)
-    return res.status(500).json({ error: 'Failed to fetch patient' })
+    console.error('getPatientDetail error:', err)
+    return res.status(500).json({ error: 'Failed to fetch patient details' })
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 5. STAFF
-// ═══════════════════════════════════════════════════════════════════════════════
 
 module.exports.getAllStaff = async (req, res) => {
   try {
@@ -1175,11 +1086,6 @@ module.exports.getLabTechs = async (req, res) => {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 6. BILLS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// GET /api/admin/bills/queue — today's billing queue (front-desk cashier view)
 module.exports.getBillingQueueToday = async (req, res) => {
   try {
     const bills = await prisma.bill.findMany({
@@ -1241,9 +1147,6 @@ module.exports.getBillingQueueToday = async (req, res) => {
   }
 }
 
-// GET /api/admin/bills?period=&status=&visit_type=&search=&page=&limit=
-// Full FinanceTab bills ledger — every Bill with visit info, patient name,
-// fee breakdown, and all associated payments.
 module.exports.getBills = async (req, res) => {
   try {
     const {
@@ -1389,12 +1292,7 @@ module.exports.getBills = async (req, res) => {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 7. PAYMENTS
-// ═══════════════════════════════════════════════════════════════════════════════
 
-// GET /api/admin/payments?period=&method=&stage=&search=&page=&limit=
-// Dedicated payment ledger — one row per Payment record, plus OTC pharmacy sales.
 module.exports.getPayments = async (req, res) => {
   try {
     const {
@@ -1518,12 +1416,6 @@ module.exports.getPayments = async (req, res) => {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 8. LAB REQUESTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// FIXED: `test_name` lives on LabRequestItem now, not LabRequest — both the
-// search filter and the response need to go through the `items` relation.
 module.exports.getLabRequests = async (req, res) => {
   const {
     page = 1, limit = 20, period = 'this_month',
@@ -1580,9 +1472,6 @@ module.exports.getLabRequests = async (req, res) => {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 9. LAB STATS
-// ═══════════════════════════════════════════════════════════════════════════════
 
 module.exports.getLabStats = async (req, res) => {
   const { period = 'this_month' } = req.query
@@ -1625,13 +1514,7 @@ module.exports.getLabStats = async (req, res) => {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 10. LAB STOCK
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// FIXED: LabStock's real columns are `name`, `current_stock`, `reorder_level`,
-// `expiry_date` (see schema.prisma) — these functions were written against
-// `item_name`, `quantity`, `reorder_at`, `expiry`, none of which exist.
+
 
 module.exports.getLabStock = async (req, res) => {
   const { search } = req.query
@@ -1742,37 +1625,194 @@ module.exports.deleteLabStockItem = async (req, res) => {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 11. EXPENSES
-// ═══════════════════════════════════════════════════════════════════════════════
 
-// GET /api/expenses?domain=clinic|pharmacy&period=&category=
-module.exports.getExpenses = async (req, res) => {
+// module.exports.getExpenses = async (req, res) => {
+//   try {
+//     const { domain = 'clinic', period = 'this_month', category } = req.query
+//     const range = getPeriodRange(period)
+
+//     const model = domain === 'pharmacy' ? prisma.pharmacyExpense : prisma.clinicExpense
+//     const where = { incurred_at: range }
+//     if (category && category !== 'all') where.category = category
+
+//     const expenses = await model.findMany({
+//       where,
+//       orderBy: { incurred_at: 'desc' },
+//       include: { recorded_by_staff: { select: { username: true } } },
+//     })
+
+//     return res.json({
+//       expenses: expenses.map(e => shapeExpense(e, domain)),
+//       stats: { total: expenses.reduce((s, e) => s + e.amount, 0) },
+//     })
+//   } catch (err) {
+//     console.error('[admin] getExpenses:', err.message)
+//     return res.status(500).json({ error: 'Failed to fetch expenses' })
+//   }
+// }
+module.exports.getExpenses = async (req, res) =>{
   try {
-    const { domain = 'clinic', period = 'this_month', category } = req.query
-    const range = getPeriodRange(period)
+    const { from, to, department } = req.query
+    if (!from || !to) {
+      return res.status(400).json({ error: 'from and to dates are required' })
+    }
+    const { fromDate, toDate } = parseDateRange(from, to)
+    const { page, limit, offset } = getPagination(req)
+    const { start: todayStart, end: todayEnd } = todayRange()
 
-    const model = domain === 'pharmacy' ? prisma.pharmacyExpense : prisma.clinicExpense
-    const where = { incurred_at: range }
-    if (category && category !== 'all') where.category = category
+    if (!department) {
+      const [
+        clinicItems,
+        pharmacyItems,
+        clinicSum,
+        pharmacySum,
+        clinicToday,
+        pharmacyToday,
+        clinicTodayCount,
+        pharmacyTodayCount,
+        clinicByCat,
+        pharmacyByCat,
+      ] = await Promise.all([
+        prisma.clinicExpense.findMany({
+          where: { incurred_at: { gte: fromDate, lte: toDate } },
+          include: { recorded_by_staff: { select: { name: true } } },
+          orderBy: { incurred_at: 'desc' },
+        }),
+        prisma.pharmacyExpense.findMany({
+          where: { incurred_at: { gte: fromDate, lte: toDate } },
+          include: { recorded_by_staff: { select: { name: true } } },
+          orderBy: { incurred_at: 'desc' },
+        }),
+        prisma.clinicExpense.aggregate({
+          where: { incurred_at: { gte: fromDate, lte: toDate } },
+          _sum: { amount: true },
+        }),
+        prisma.pharmacyExpense.aggregate({
+          where: { incurred_at: { gte: fromDate, lte: toDate } },
+          _sum: { amount: true },
+        }),
+        prisma.clinicExpense.aggregate({
+          where: { incurred_at: { gte: todayStart, lte: todayEnd } },
+          _sum: { amount: true },
+        }),
+        prisma.pharmacyExpense.aggregate({
+          where: { incurred_at: { gte: todayStart, lte: todayEnd } },
+          _sum: { amount: true },
+        }),
+        prisma.clinicExpense.count({
+          where: { incurred_at: { gte: todayStart, lte: todayEnd } },
+        }),
+        prisma.pharmacyExpense.count({
+          where: { incurred_at: { gte: todayStart, lte: todayEnd } },
+        }),
+        prisma.clinicExpense.groupBy({
+          by: ['category'],
+          where: { incurred_at: { gte: fromDate, lte: toDate } },
+          _sum: { amount: true },
+        }),
+        prisma.pharmacyExpense.groupBy({
+          by: ['category'],
+          where: { incurred_at: { gte: fromDate, lte: toDate } },
+          _sum: { amount: true },
+        }),
+      ])
 
-    const expenses = await model.findMany({
-      where,
-      orderBy: { incurred_at: 'desc' },
-      include: { recorded_by_staff: { select: { username: true } } },
-    })
+      const all = [
+        ...clinicItems.map((e) => ({ ...e, department: 'reception' })),
+        ...pharmacyItems.map((e) => ({ ...e, department: 'pharmacy' })),
+      ].sort((a, b) => new Date(b.incurred_at) - new Date(a.incurred_at))
 
-    return res.json({
-      expenses: expenses.map(e => shapeExpense(e, domain)),
-      stats: { total: expenses.reduce((s, e) => s + e.amount, 0) },
-    })
+      const total = all.length
+      const expenses = all.slice(offset, offset + limit)
+
+      const byCategory = {}
+      for (const g of [...clinicByCat, ...pharmacyByCat]) {
+        const key = g.category || 'uncategorized'
+        byCategory[key] = (byCategory[key] || 0) + (g._sum.amount || 0)
+      }
+
+      res.json({
+        expenses: expenses.map((e) => ({
+          id: e.id,
+          description: e.description,
+          amount: e.amount,
+          category: e.category,
+          recorded_by: e.recorded_by_staff?.name || 'Unknown',
+          recorded_at: e.incurred_at,
+          department: e.department,
+        })),
+        stats: {
+          total: (clinicSum._sum.amount || 0) + (pharmacySum._sum.amount || 0),
+          today_total: (clinicToday._sum.amount || 0) + (pharmacyToday._sum.amount || 0),
+          today_count: clinicTodayCount + pharmacyTodayCount,
+          by_department: {
+            reception: clinicSum._sum.amount || 0,
+            pharmacy: pharmacySum._sum.amount || 0,
+          },
+          by_category: byCategory,
+        },
+        page,
+        pages: Math.max(1, Math.ceil(total / limit)),
+        total,
+      })
+    } else {
+      const model = department === 'pharmacy' ? prisma.pharmacyExpense : prisma.clinicExpense
+      const where = { incurred_at: { gte: fromDate, lte: toDate } }
+
+      const [items, count, totalSum, todaySum, todayCount, categoryGroups] = await Promise.all([
+        model.findMany({
+          where,
+          include: { recorded_by_staff: { select: { name: true } } },
+          orderBy: { incurred_at: 'desc' },
+          skip: offset,
+          take: limit,
+        }),
+        model.count({ where }),
+        model.aggregate({ where, _sum: { amount: true } }),
+        model.aggregate({
+          where: { ...where, incurred_at: { gte: todayStart, lte: todayEnd } },
+          _sum: { amount: true },
+        }),
+        model.count({
+          where: { ...where, incurred_at: { gte: todayStart, lte: todayEnd } },
+        }),
+        model.groupBy({
+          by: ['category'],
+          where,
+          _sum: { amount: true },
+        }),
+      ])
+
+      const byCategory = Object.fromEntries(
+        categoryGroups.map((g) => [g.category || 'uncategorized', g._sum.amount || 0])
+      )
+
+      res.json({
+        expenses: items.map((e) => ({
+          id: e.id,
+          description: e.description,
+          amount: e.amount,
+          category: e.category,
+          recorded_by: e.recorded_by_staff?.name || 'Unknown',
+          recorded_at: e.incurred_at,
+        })),
+        stats: {
+          total: totalSum._sum.amount || 0,
+          today_total: todaySum._sum.amount || 0,
+          today_count: todayCount,
+          by_category: byCategory,
+        },
+        page,
+        pages: Math.max(1, Math.ceil(count / limit)),
+        total: count,
+      })
+    }
   } catch (err) {
-    console.error('[admin] getExpenses:', err.message)
-    return res.status(500).json({ error: 'Failed to fetch expenses' })
+    console.error('Get expenses error:', err)
+    res.status(500).json({ error: 'Failed to load expenses' })
   }
 }
 
-// GET /api/expenses/stats?domain=&period=
 module.exports.getExpenseStats = async (req, res) => {
   try {
     const { domain = 'clinic', period = 'this_month' } = req.query
@@ -1821,7 +1861,6 @@ module.exports.getExpenseStats = async (req, res) => {
   }
 }
 
-// POST /api/expenses  — body: { domain: 'clinic'|'pharmacy', description, amount, category?, incurred_at? }
 module.exports.createExpense = async (req, res) => {
   try {
     const { domain = 'clinic', description, amount, category, incurred_at } = req.body
@@ -1857,7 +1896,6 @@ module.exports.createExpense = async (req, res) => {
   }
 }
 
-// DELETE /api/expenses/:id?domain=clinic|pharmacy
 module.exports.deleteExpense = async (req, res) => {
   try {
     const id = parseInt(req.params.id)
@@ -1880,13 +1918,9 @@ module.exports.deleteExpense = async (req, res) => {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 12. SETTINGS
-// ═══════════════════════════════════════════════════════════════════════════════
-
 module.exports.getSettings = async (req, res) => {
   try {
-    const s = await getOrCreateSettings()
+    const s = await getSettings()
     return res.json({
       settings: {
         name: s.name,
@@ -1894,11 +1928,7 @@ module.exports.getSettings = async (req, res) => {
         address: s.address,
         phone: s.phone,
         email: s.email,
-        visit_rules: s.visit_rules ?? null,
-        lab_settings: s.lab_settings ?? null,
         pharmacy_settings: s.pharmacy_settings ?? null,
-        notifications: s.notifications ?? null,
-        security: s.security ?? null,
       },
     })
   } catch (err) {
@@ -1914,57 +1944,50 @@ module.exports.patchSettings = async (req, res) => {
     const username = req.user?.username ?? 'Admin'
     const ip = req.ip ?? req.headers['x-forwarded-for'] ?? null
 
-    if (body.archive_visits_older_than_days != null) {
-      const days = parseInt(body.archive_visits_older_than_days)
-      if (isNaN(days) || days < 1) return res.status(400).json({ error: 'Must be a positive integer' })
-      const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
-      const result = await prisma.visit.updateMany({
-        where: { status: 'done', arrived_at: { lt: cutoff } },
-        data: { status: 'archived' },
-      })
-      await writeAuditLog({ staffId, user: username, action: 'Archive Visits', description: `Archived ${result.count} visit(s) older than ${days} days`, category: 'patient', ipAddress: ip })
-      return res.json({ success: true, archived: result.count })
-    }
-
-    if (body.purge_notifications_older_than_days != null) {
-      const days = parseInt(body.purge_notifications_older_than_days)
-      if (isNaN(days) || days < 1) return res.status(400).json({ error: 'Must be a positive integer' })
-      const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
-      const result = await prisma.notification.deleteMany({ where: { timestamp: { lt: cutoff } } })
-      await writeAuditLog({ staffId, user: username, action: 'Purge Notifications', description: `Deleted ${result.count} notification(s) older than ${days} days`, category: 'staff', ipAddress: ip })
-      return res.json({ success: true, deleted: result.count })
-    }
-
-    const CLINIC_FIELDS = ['name', 'tagline', 'address', 'phone', 'email']
-    const JSON_FIELDS = ['visit_rules', 'lab_settings', 'pharmacy_settings', 'notifications', 'security']
+    const FIELDS = ['name', 'tagline', 'address', 'phone', 'email', 'lab_settings', 'pharmacy_settings']
     const data = {}
-    CLINIC_FIELDS.forEach(k => { if (k in body) data[k] = body[k] })
-    JSON_FIELDS.forEach(k => { if (k in body) data[k] = body[k] })
+    for (const k of FIELDS) {
+      if (k in body) data[k] = body[k]
+    }
 
-    if (Object.keys(data).length === 0) return res.status(400).json({ error: 'No valid fields to update' })
+    if (Object.keys(data).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' })
+    }
 
-    const settings = await getOrCreateSettings()
-    // FIXED: was `prisma.settings.update` — model is `clinicSettings`.
-    await prisma.clinicSettings.update({ where: { id: settings.id }, data })
-    await writeAuditLog({ staffId, user: username, action: 'Settings Updated', description: `Updated: ${Object.keys(data).join(', ')}`, category: 'staff', ipAddress: ip })
+    // Constant id, upsert: a deleted or reseeded row recreates instead of
+    // throwing P2025. The cache is never consulted on the write path.
+    await prisma.clinicSettings.upsert({
+      where: { id: SETTINGS_ID },
+      update: data,
+      create: { id: SETTINGS_ID, ...data },
+    })
 
-    return res.json({ success: true })
+    await invalidateSettings()
+
+    await writeAuditLog({
+      staffId,
+      user: username,
+      action: 'Settings Updated',
+      description: `Updated: ${Object.keys(data).join(', ')}`,
+      category: 'staff',
+      ipAddress: ip,
+    })
+
+    return res.status(200).json({ success: true })
   } catch (err) {
     console.error('patchSettings', err)
+    await invalidateSettings().catch(() => { })
     return res.status(500).json({ error: 'Failed to save settings' })
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 13. AUDIT LOG
-// ═══════════════════════════════════════════════════════════════════════════════
 
 exports.getLogs = async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1)
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50))
     const { category, search } = req.query
- 
+
     const where = {}
     if (category && category !== 'all') where.category = category
     if (search?.trim()) {
@@ -1975,7 +1998,7 @@ exports.getLogs = async (req, res) => {
         { user: { contains: q, mode: 'insensitive' } },
       ]
     }
- 
+
     const [rows, total] = await Promise.all([
       prisma.auditLog.findMany({
         where,
@@ -1986,7 +2009,7 @@ exports.getLogs = async (req, res) => {
       }),
       prisma.auditLog.count({ where }),
     ])
- 
+
     const logs = rows.map((r) => ({
       id: r.id,
       category: r.category,
@@ -1997,15 +2020,14 @@ exports.getLogs = async (req, res) => {
       ip: r.ip_address ?? null,
       timestamp: r.timestamp,
     }))
- 
+
     res.json({ logs, total })
   } catch (err) {
     console.error('getLogs', err)
     res.status(500).json({ error: 'Failed to fetch logs' })
   }
 }
- 
-// GET /api/admin/logs/stats
+
 exports.getLogStats = async (req, res) => {
   try {
     const range = todayRange()
@@ -2020,10 +2042,6 @@ exports.getLogStats = async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch log stats' })
   }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// 14. SESSIONS
-// ═══════════════════════════════════════════════════════════════════════════════
 
 module.exports.getSessions = async (req, res) => {
   try {
@@ -2075,168 +2093,255 @@ module.exports.deleteSession = async (req, res) => {
 
 
 module.exports.getDrugStock = async (req, res) => {
-  const { search } = req.query
+  const { search, category, expiry_filter, page = '1', limit = '20' } = req.query
   try {
-    const where = search
-      ? {
-          OR: [
-            { name: { contains: search, mode: 'insensitive' } },
-            { generic_name: { contains: search, mode: 'insensitive' } },
-          ],
-        }
-      : {}
-    const items = await prisma.drugStock.findMany({ where, orderBy: { name: 'asc' } })
-    return res.json({ items })
+    const where = {}
+
+    if (search) {
+      where.OR = [
+        { name: { contains: search, mode: 'insensitive' } },
+        { generic_name: { contains: search, mode: 'insensitive' } },
+      ]
+    }
+
+    if (category && category !== 'all') where.category = category
+
+    if (expiry_filter && expiry_filter !== 'all') {
+      const now = new Date()
+      const days = expiry_filter === '1month' ? 30 : 90
+      const future = new Date()
+      future.setDate(now.getDate() + days)
+      where.batches = {
+        some: {
+          is_exhausted: false,
+          expiry_date: { gte: now, lte: future },
+        },
+      }
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit)
+    const take = parseInt(limit)
+
+    const [items, total] = await Promise.all([
+      prisma.product.findMany({
+        where,
+        skip,
+        take,
+        orderBy: { name: 'asc' },
+        include: {
+          batches: {
+            where: { is_exhausted: false },
+            orderBy: { expiry_date: 'asc' },
+          },
+        },
+      }),
+      prisma.product.count({ where }),
+    ])
+
+    const hasMore = skip + items.length < total
+    const nextPage = hasMore ? parseInt(page) + 1 : null
+
+    return res.json({ items, total, nextPage, hasMore, page: parseInt(page) })
   } catch (error) {
     console.error('getDrugStock error:', error.message)
-    return res.status(500).json({ error: 'Failed to fetch drug stock' })
+    return res.status(500).json({ error: 'Failed to fetch stock' })
   }
 }
- 
-// POST /api/admin/drug-stock
+
+
 module.exports.createDrugStockItem = async (req, res) => {
   const {
-    name, generic_name, category, form, strength,
+    name, generic_name, category, sub_category, form, strength,
     current_stock, unit, reorder_level,
     unit_cost, normal_price, promotional_price, wholesale_price,
-    supplier, batch_number, expiry_date,
+    supplier, expiry_date,
   } = req.body
- 
-  if (!name || !name.trim()) return res.status(400).json({ error: 'Drug name is required' })
-  if (current_stock === undefined || current_stock === null) {
+
+  if (!name || !name.trim())
+    return res.status(400).json({ error: 'Item name is required' })
+  if (current_stock === undefined || current_stock === null)
     return res.status(400).json({ error: 'Current stock is required' })
-  }
- 
+
   try {
-    const item = await prisma.drugStock.create({
-      data: {
-        name: name.trim(),
-        generic_name: generic_name?.trim() || '',
-        category: category ?? null,
-        form: form ?? null,
-        strength: strength ?? null,
-        current_stock: Number(current_stock),
-        unit: unit || 'tablets',
-        reorder_level: Number(reorder_level) || 0,
-        unit_cost: Number(unit_cost) || 0,
-        normal_price: Number(normal_price) || 0,
-        promotional_price: Number(promotional_price) || 0,
-        wholesale_price: Number(wholesale_price) || 0,
-        supplier: supplier ?? null,
-        batch_number: batch_number ?? null,
-        expiry_date: expiry_date ? new Date(expiry_date) : null,
-      },
+    const result = await prisma.$transaction(async (tx) => {
+      const item = await tx.product.create({
+        data: {
+          name: name.trim(),
+          generic_name: generic_name?.trim() || null,
+          category: category || 'general',
+          sub_category: sub_category?.trim() || null,
+          form: form ?? null,
+          strength: strength ?? null,
+          current_stock: Number(current_stock),
+          unit: unit || 'pieces',
+          reorder_level: Number(reorder_level) || 0,
+          unit_cost: Number(unit_cost) || 0,
+          normal_price: Number(normal_price) || 0,
+          promotional_price: Number(promotional_price) || 0,
+          wholesale_price: Number(wholesale_price) || 0,
+          supplier: supplier ?? null,
+        },
+      })
+
+      if (Number(current_stock) > 0) {
+        await tx.productBatch.create({
+          data: {
+            product_id: item.id,
+            batch_number: '1',
+            quantity: Number(current_stock),
+            unit_cost: Number(unit_cost) || 0,
+            expiry_date: expiry_date ? new Date(expiry_date) : null,
+          },
+        })
+
+        await tx.stockMovement.create({
+          data: {
+            product_id: item.id,
+            delta: Number(current_stock),
+            reason: 'restock',
+            ref_type: 'product_creation',
+            balance_after: Number(current_stock),
+            staff_id: req.user?.id ?? null,
+            note: 'Initial stock',
+          },
+        })
+      }
+
+      return item
     })
-    return res.status(201).json({ message: 'Drug added', item })
+
+    return res.status(201).json({ message: 'Item added', item: result })
   } catch (error) {
-    if (error.code === 'P2002') return res.status(409).json({ error: 'A drug with this name already exists' })
+    if (error.code === 'P2002')
+      return res.status(409).json({ error: 'An item with this name already exists' })
     console.error('createDrugStockItem error:', error.message)
-    return res.status(500).json({ error: 'Failed to add drug' })
+    return res.status(500).json({ error: 'Failed to add item' })
   }
 }
- 
-// PUT /api/admin/drug-stock/:id
-// Edits metadata + price tiers. Does NOT touch current_stock — quantity changes
-// go through the /quantity endpoint (Restock action) only.
+
 module.exports.updateDrugStockItem = async (req, res) => {
   const { id } = req.params
   const {
-    name, generic_name, category, form, strength,
-    unit, reorder_level,
-    unit_cost, normal_price, promotional_price, wholesale_price,
-    supplier, batch_number, expiry_date,
+    name, reorder_level, normal_price, promotional_price, wholesale_price,
+    supplier,
   } = req.body
- 
-  if (!name || !name.trim()) return res.status(400).json({ error: 'Drug name is required' })
- 
+
+  if (!name || !name.trim())
+    return res.status(400).json({ error: 'Item name is required' })
+
   try {
-    const existing = await prisma.drugStock.findUnique({ where: { id: Number(id) } })
-    if (!existing) return res.status(404).json({ error: 'Drug not found' })
- 
-    const item = await prisma.drugStock.update({
+    const existing = await prisma.product.findUnique({ where: { id: Number(id) } })
+    if (!existing) return res.status(404).json({ error: 'Item not found' })
+
+    const item = await prisma.product.update({
       where: { id: Number(id) },
       data: {
         name: name.trim(),
-        generic_name: generic_name !== undefined ? (generic_name?.trim() || '') : existing.generic_name,
-        category: category ?? existing.category,
-        form: form ?? existing.form,
-        strength: strength ?? existing.strength,
-        unit: unit ?? existing.unit,
-        reorder_level: reorder_level !== undefined ? Number(reorder_level) : existing.reorder_level,
-        unit_cost: unit_cost !== undefined ? Number(unit_cost) : existing.unit_cost,
-        normal_price: normal_price !== undefined ? Number(normal_price) : existing.normal_price,
-        promotional_price: promotional_price !== undefined ? Number(promotional_price) : existing.promotional_price,
-        wholesale_price: wholesale_price !== undefined ? Number(wholesale_price) : existing.wholesale_price,
+        reorder_level:
+          reorder_level !== undefined ? Number(reorder_level) : existing.reorder_level,
+        normal_price:
+          normal_price !== undefined ? Number(normal_price) : existing.normal_price,
+        promotional_price:
+          promotional_price !== undefined
+            ? Number(promotional_price)
+            : existing.promotional_price,
+        wholesale_price:
+          wholesale_price !== undefined ? Number(wholesale_price) : existing.wholesale_price,
         supplier: supplier ?? existing.supplier,
-        batch_number: batch_number ?? existing.batch_number,
-        // NOTE: null keeps the existing date (cannot clear expiry via edit — same
-        // limitation as the lab edit; change to `=== null ? null : ...` if clearing is needed)
-        expiry_date: expiry_date ? new Date(expiry_date) : existing.expiry_date,
       },
     })
-    return res.json({ message: 'Drug updated', item })
+    return res.json({ message: 'Item updated', item })
   } catch (error) {
-    if (error.code === 'P2002') return res.status(409).json({ error: 'A drug with this name already exists' })
+    if (error.code === 'P2002')
+      return res.status(409).json({ error: 'An item with this name already exists' })
     console.error('updateDrugStockItem error:', error.message)
-    return res.status(500).json({ error: 'Failed to update drug' })
+    return res.status(500).json({ error: 'Failed to update item' })
   }
 }
- 
-// PATCH /api/admin/drug-stock/:id/quantity
-// ADD via { adjustment } (restock), or SET via { quantity }. Never goes negative.
+
 module.exports.updateDrugStockQuantity = async (req, res) => {
   const { id } = req.params
-  const { quantity, adjustment } = req.body
- 
+  const { quantity, adjustment, expiry_date, unit_cost } = req.body
+
   try {
-    const existing = await prisma.drugStock.findUnique({ where: { id: Number(id) } })
-    if (!existing) return res.status(404).json({ error: 'Drug not found' })
- 
-    const newQuantity = adjustment !== undefined
-      ? existing.current_stock + Number(adjustment)
-      : Number(quantity)
- 
-    if (!Number.isFinite(newQuantity) || newQuantity < 0) {
-      return res.status(400).json({ error: 'Quantity cannot be negative' })
-    }
- 
-    const item = await prisma.drugStock.update({
+    const existing = await prisma.product.findUnique({
       where: { id: Number(id) },
-      data: { current_stock: newQuantity },
+      include: { batches: true },
     })
-    return res.json({ message: 'Quantity updated', item })
+    if (!existing) return res.status(404).json({ error: 'Item not found' })
+
+    const qty = adjustment !== undefined ? Number(adjustment) : Number(quantity)
+    if (!Number.isFinite(qty) || qty <= 0)
+      return res.status(400).json({ error: 'Quantity must be a positive number' })
+
+    const newStock = existing.current_stock + qty
+
+    let maxBatchNum = 0
+    for (const b of existing.batches) {
+      const num = parseInt(b.batch_number, 10)
+      if (!isNaN(num) && num > maxBatchNum) maxBatchNum = num
+    }
+    const nextBatchNum = String(maxBatchNum + 1)
+
+    const result = await prisma.$transaction(async (tx) => {
+      await tx.product.update({
+        where: { id: Number(id) },
+        data: { current_stock: newStock },
+      })
+
+      await tx.productBatch.create({
+        data: {
+          product_id: Number(id),
+          batch_number: nextBatchNum,
+          quantity: qty,
+          unit_cost: Number(unit_cost) || existing.unit_cost,
+          expiry_date: expiry_date ? new Date(expiry_date) : null,
+        },
+      })
+
+      await tx.stockMovement.create({
+        data: {
+          product_id: Number(id),
+          delta: qty,
+          reason: 'restock',
+          ref_type: 'manual_restock',
+          balance_after: newStock,
+          staff_id: req.user?.id ?? null,
+          note: expiry_date
+            ? `Batch ${nextBatchNum}, expires ${expiry_date}`
+            : `Batch ${nextBatchNum}`,
+        },
+      })
+
+      return tx.product.findUnique({
+        where: { id: Number(id) },
+        include: { batches: { where: { is_exhausted: false }, orderBy: { expiry_date: 'asc' } } },
+      })
+    })
+
+    return res.json({ message: 'Quantity updated', item: result })
   } catch (error) {
     console.error('updateDrugStockQuantity error:', error.message)
     return res.status(500).json({ error: 'Failed to update quantity' })
   }
 }
- 
-// DELETE /api/admin/drug-stock/:id
-// OtcSaleItem.drug_id is onDelete: SetNull, so this won't cascade-fail on sale history.
+
 module.exports.deleteDrugStockItem = async (req, res) => {
   const { id } = req.params
   try {
-    const existing = await prisma.drugStock.findUnique({ where: { id: Number(id) } })
-    if (!existing) return res.status(404).json({ error: 'Drug not found' })
-    await prisma.drugStock.delete({ where: { id: Number(id) } })
-    return res.json({ message: 'Drug deleted' })
+    const existing = await prisma.product.findUnique({ where: { id: Number(id) } })
+    if (!existing) return res.status(404).json({ error: 'Item not found' })
+    await prisma.product.delete({ where: { id: Number(id) } })
+    return res.json({ message: 'Item deleted' })
   } catch (error) {
     console.error('deleteDrugStockItem error:', error.message)
-    return res.status(500).json({ error: 'Failed to delete drug' })
+    return res.status(500).json({ error: 'Failed to delete item' })
   }
 }
- 
- 
-// ═══════════════════════════════════════════════════════════════════════════════
-// CHARGE TEMPLATES  (ChargeTemplate model)
-//
-// One flat table. category is the ChargeCategory enum — reject anything outside it.
-// The frontend aliases amount<->price; the DB column is `amount`.
-// ═══════════════════════════════════════════════════════════════════════════════
- 
+
 const CHARGE_CATEGORIES = ['consultation', 'procedure', 'lab', 'medication']
- 
-// GET /api/admin/charge-templates
+
+
 module.exports.getChargeTemplates = async (req, res) => {
   try {
     const templates = await prisma.chargeTemplate.findMany({
@@ -2248,12 +2353,13 @@ module.exports.getChargeTemplates = async (req, res) => {
     return res.status(500).json({ error: 'Failed to fetch charge templates' })
   }
 }
- 
-// POST /api/admin/charge-templates
+
+
 module.exports.createChargeTemplate = async (req, res) => {
   const { name, category, amount, is_active } = req.body
- 
-  if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' })
+  const currentUser = req.user
+
+  if (!name || !name.trim()) return res.status(400).json({ error: 'template name is required!' })
   if (!CHARGE_CATEGORIES.includes(category)) {
     return res.status(400).json({ error: `Category must be one of: ${CHARGE_CATEGORIES.join(', ')}` })
   }
@@ -2261,10 +2367,20 @@ module.exports.createChargeTemplate = async (req, res) => {
   if (!Number.isFinite(amt) || amt < 0) {
     return res.status(400).json({ error: 'Amount must be a non-negative number' })
   }
- 
+
   try {
     const template = await prisma.chargeTemplate.create({
       data: { name: name.trim(), category, amount: Math.round(amt), is_active: is_active !== false },
+    })
+     await writeAuditLog({
+      staffId: currentUser.id,
+      user: currentUser.username,
+      action: 'charge template created',
+      description: `created charge template with id ${template.id})`,
+      category: 'charge_template',
+      entity: 'charge template',
+      entityId: id,
+      ipAddress: req.ip ?? req.headers['x-forwarded-for'] ?? null,
     })
     return res.status(201).json({ message: 'Template added', template })
   } catch (error) {
@@ -2273,16 +2389,16 @@ module.exports.createChargeTemplate = async (req, res) => {
     return res.status(500).json({ error: 'Failed to add template' })
   }
 }
- 
-// PATCH /api/admin/charge-templates/:id
+
 module.exports.updateChargeTemplate = async (req, res) => {
   const { id } = req.params
   const { name, category, amount, is_active } = req.body
- 
+  const currentUser = req.user
+
   try {
     const existing = await prisma.chargeTemplate.findUnique({ where: { id: Number(id) } })
     if (!existing) return res.status(404).json({ error: 'Template not found' })
- 
+
     const data = {}
     if (name !== undefined) {
       if (!name.trim()) return res.status(400).json({ error: 'Name cannot be empty' })
@@ -2300,10 +2416,20 @@ module.exports.updateChargeTemplate = async (req, res) => {
       data.amount = Math.round(amt)
     }
     if (is_active !== undefined) data.is_active = !!is_active
- 
+
     if (Object.keys(data).length === 0) return res.status(400).json({ error: 'No fields to update' })
- 
+
     const template = await prisma.chargeTemplate.update({ where: { id: Number(id) }, data })
+     await writeAuditLog({
+      staffId: currentUser.id,
+      user: currentUser.username,
+      action: 'charge template updated',
+      description: `updated charge template with id ${template.id})`,
+      category: 'charge_template',
+      entity: 'charge template',
+      entityId: id,
+      ipAddress: req.ip ?? req.headers['x-forwarded-for'] ?? null,
+    })
     return res.json({ message: 'Template updated', template })
   } catch (error) {
     if (error.code === 'P2002') return res.status(409).json({ error: 'A template with this name already exists' })
@@ -2311,33 +2437,77 @@ module.exports.updateChargeTemplate = async (req, res) => {
     return res.status(500).json({ error: 'Failed to update template' })
   }
 }
- 
-// DELETE /api/admin/charge-templates/:id
+
 module.exports.deleteChargeTemplate = async (req, res) => {
   const { id } = req.params
+  const currentUser = req.user
   try {
     const existing = await prisma.chargeTemplate.findUnique({ where: { id: Number(id) } })
     if (!existing) return res.status(404).json({ error: 'Template not found' })
     await prisma.chargeTemplate.delete({ where: { id: Number(id) } })
+    await writeAuditLog({
+      staffId: currentUser.id,
+      user: currentUser.username,
+      action: 'charge template deleted',
+      description: `deleted charge template with id ${id})`,
+      category: 'charge_template',
+      entity: 'charge template',
+      entityId: id,
+      ipAddress: req.ip ?? req.headers['x-forwarded-for'] ?? null,
+    })
     return res.json({ message: 'Template deleted' })
   } catch (error) {
     console.error('deleteChargeTemplate error:', error.message)
     return res.status(500).json({ error: 'Failed to delete template' })
   }
 }
- 
- 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RESTOCK VERIFICATION  (RestockRequest model)
-//
-// item_id is polymorphic — points to DrugStock (department 'pharmacy') or
-// LabStock (department 'lab'); there is no DB foreign key. Verify adds the
-// received quantity to the correct table atomically, only from 'pending', and
-// stamps who verified it from the auth token (client-supplied verified_by is
-// ignored for integrity).
-// ═══════════════════════════════════════════════════════════════════════════════
- 
-// GET /api/admin/restocks
+
+// GET /api/admin/lab-catalog
+module.exports.getLabCatalog = async (req, res) => {
+  try {
+    const tests = await prisma.labTestCatalog.findMany({
+      orderBy: [{ category: 'asc' }, { name: 'asc' }],
+      select: {
+        id: true,
+        name: true,
+        category: true,
+        unit_cost: true,
+        is_active: true,
+        reference_range: true,
+      },
+    })
+    res.json({ tests })
+  } catch (err) {
+    console.error('getLabCatalog error:', err)
+    res.status(500).json({ error: 'Failed to fetch lab catalog' })
+  }
+}
+
+// PATCH /api/admin/lab-catalog/:id
+module.exports.updateLabCatalogItem = async (req, res) => {
+  try {
+    const id = Number(req.params.id)
+    const { unit_cost, is_active } = req.body
+
+    const data = {}
+    if (unit_cost !== undefined) data.unit_cost = Math.max(0, Number(unit_cost) || 0)
+    if (is_active !== undefined) data.is_active = !!is_active
+
+    if (Object.keys(data).length === 0) {
+      return res.status(400).json({ error: 'No fields to update' })
+    }
+
+    const item = await prisma.labTestCatalog.update({
+      where: { id },
+      data,
+      select: { id: true, name: true, category: true, unit_cost: true, is_active: true },
+    })
+    res.json({ item })
+  } catch (err) {
+    console.error('updateLabCatalogItem error:', err)
+    res.status(500).json({ error: 'Failed to update test' })
+  }
+}
 module.exports.getRestocks = async (req, res) => {
   try {
     const restocks = await prisma.restockRequest.findMany({ orderBy: { requested_at: 'desc' } })
@@ -2353,86 +2523,148 @@ module.exports.getRestocks = async (req, res) => {
     return res.status(500).json({ error: 'Failed to fetch restock requests' })
   }
 }
- 
-// PATCH /api/admin/restocks/:id/verify
+
 module.exports.verifyRestock = async (req, res) => {
   const id = Number(req.params.id)
-  const { verification_notes, adjusted_qty } = req.body
-  const staffId = req.user?.id
-  const username = req.user?.username ?? 'Admin'
+  const { verification_notes, adjusted_qty, expiry_date } = req.body
+  const currentUser = req.user
   const ip = req.ip ?? req.headers['x-forwarded-for'] ?? null
- 
+
   try {
     const updated = await prisma.$transaction(async (tx) => {
       const r = await tx.restockRequest.findUnique({ where: { id } })
       if (!r) throw Object.assign(new Error('Restock request not found'), { http: 404 })
-      if (r.status !== 'pending') throw Object.assign(new Error('Request already processed'), { http: 409 })
- 
-      const qty = adjusted_qty != null ? Number(adjusted_qty) : r.received_qty
-      if (!Number.isFinite(qty) || qty < 0) throw Object.assign(new Error('Invalid quantity'), { http: 400 })
- 
+      if (r.status !== 'pending')
+        throw Object.assign(new Error('Request already processed'), { http: 409 })
+
+      const qty = adjusted_qty != null ? Number(adjusted_qty) : r.received_qty || r.quantity
+      if (!Number.isFinite(qty) || qty < 0)
+        throw Object.assign(new Error('Invalid quantity'), { http: 400 })
+
       if (r.department === 'pharmacy') {
-        await tx.drugStock.update({ where: { id: r.item_id }, data: { current_stock: { increment: qty } } })
-      } else {
-        await tx.labStock.update({ where: { id: r.item_id }, data: { current_stock: { increment: qty } } })
+        if (!r.product_id)
+          throw Object.assign(new Error('Restock request has no linked product'), { http: 422 })
+
+        const product = await tx.product.findUnique({
+          where: { id: r.product_id },
+          include: { batches: true },
+        })
+        if (!product)
+          throw Object.assign(new Error('Product no longer exists in the catalog'), { http: 404 })
+
+        let maxBatchNum = 0
+        for (const b of product.batches) {
+          const num = parseInt(b.batch_number, 10)
+          if (!isNaN(num) && num > maxBatchNum) maxBatchNum = num
+        }
+        const nextBatchNum = String(maxBatchNum + 1)
+
+        const finalExpiry = expiry_date ? new Date(expiry_date) : r.expiry_date
+        const finalUnitCost = r.unit_cost ?? product.unit_cost
+
+        await tx.product.update({
+          where: { id: product.id },
+          data: { current_stock: { increment: qty } },
+        })
+
+        await tx.productBatch.create({
+          data: {
+            product_id: product.id,
+            batch_number: nextBatchNum,
+            expiry_date: finalExpiry,
+            quantity: qty,
+            unit_cost: finalUnitCost,
+            received_by: currentUser.username,
+            notes: verification_notes ?? null,
+          },
+        })
+
+        await tx.stockMovement.create({
+          data: {
+            product_id: product.id,
+            delta: qty,
+            reason: 'restock',
+            ref_type: 'restock_request',
+            ref_id: r.id,
+            balance_after: product.current_stock + qty,
+            staff_id: currentUser.id ?? null,
+            note: verification_notes ?? null,
+          },
+        })
+      } else if (r.department === 'lab') {
+        if (!r.lab_stock_id)
+          throw Object.assign(new Error('Restock request has no linked lab stock item'), {
+            http: 422,
+          })
+        const labItem = await tx.labStock.findUnique({ where: { id: r.lab_stock_id } })
+        if (!labItem)
+          throw Object.assign(new Error('Lab stock item no longer exists'), { http: 409 })
+        await tx.labStock.update({
+          where: { id: r.lab_stock_id },
+          data: { current_stock: { increment: qty } },
+        })
       }
- 
+
       return tx.restockRequest.update({
         where: { id },
         data: {
           status: 'approved',
           received_qty: qty,
-          verified_by: username,
+          verified_by: currentUser.username,
           verification_notes: verification_notes ?? null,
           verified_at: new Date(),
         },
       })
     })
- 
+
     await writeAuditLog({
-      staffId, user: username, action: 'Restock Verified',
-      description: `Verified restock of ${updated.item_name} (+${updated.received_qty})`,
-      category: 'restock', entity: 'RestockRequest', entityId: id, ipAddress: ip,
+      staffId: currentUser.id,
+      user: currentUser.username,
+      action: 'Restock Verified',
+      description: `Verified restock of ${updated.item_name ?? 'item'} (+${updated.received_qty} units)`,
+      category: 'restock',
+      entity: 'RestockRequest',
+      entityId: id,
+      ipAddress: ip,
     })
- 
+
     return res.json({ success: true, restock: updated })
   } catch (err) {
     if (err.http) return res.status(err.http).json({ error: err.message })
-    if (err.code === 'P2025') return res.status(409).json({ error: 'Target stock item no longer exists' })
+    if (err.code === 'P2025')
+      return res.status(409).json({ error: 'Target stock item no longer exists' })
     console.error('verifyRestock error:', err.message)
     return res.status(500).json({ error: 'Failed to verify restock' })
   }
 }
- 
-// PATCH /api/admin/restocks/:id/reject
+
 module.exports.rejectRestock = async (req, res) => {
   const id = Number(req.params.id)
   const { verification_notes } = req.body
-  const staffId = req.user?.id
-  const username = req.user?.username ?? 'Admin'
+  const currentUser = req.user
   const ip = req.ip ?? req.headers['x-forwarded-for'] ?? null
- 
+
   try {
     const r = await prisma.restockRequest.findUnique({ where: { id } })
     if (!r) return res.status(404).json({ error: 'Restock request not found' })
     if (r.status !== 'pending') return res.status(409).json({ error: 'Request already processed' })
- 
+
     const updated = await prisma.restockRequest.update({
       where: { id },
       data: {
         status: 'rejected',
-        verified_by: username,
+        verified_by: currentUser.username,
         verification_notes: verification_notes ?? null,
         verified_at: new Date(),
       },
     })
- 
+
     await writeAuditLog({
-      staffId, user: username, action: 'Restock Rejected',
-      description: `Rejected restock of ${updated.item_name}`,
+      staffId: currentUser.id, user: currentUser.username, action: 'Restock Rejected',
+      description: `Rejected restock of ${updated.id}`,
       category: 'restock', entity: 'RestockRequest', entityId: id, ipAddress: ip,
     })
- 
+
     return res.json({ success: true, restock: updated })
   } catch (err) {
     console.error('rejectRestock error:', err.message)
@@ -2441,38 +2673,36 @@ module.exports.rejectRestock = async (req, res) => {
 }
 
 
-// REFERRALS (lReferral model)
-
 module.exports.getReferrals = async (req, res) => {
   try {
     const rows = await prisma.Referral.findMany({
       include: {
         visit: {
           include: {
-            patient: { select: { name: true } },
+            patient: { select: { name: true } }
           },
         },
       },
-      orderBy: { referred_at: 'desc' },
+      orderBy: { created_at: 'desc' },
     })
- 
+
     const referrals = rows.map(shapeReferral)
- 
+
     // ── Stats ────────────────────────────────────────────────────────────────
     const pending = referrals.filter(r => r.status === 'pending')
-    const paid    = referrals.filter(r => r.status === 'paid')
- 
+    const paid = referrals.filter(r => r.status === 'paid')
+
     const sum = (arr, key) => arr.reduce((acc, r) => acc + (r[key] ?? 0), 0)
- 
+
     const stats = {
-      total_referrals:      referrals.length,
-      pending_count:        pending.length,
-      paid_count:           paid.length,
-      total_commission:     sum(referrals, 'commission_amount'),
-      pending_commission:   sum(pending,   'commission_amount'),
-      paid_commission:      sum(paid,      'amount_paid'),   // actual paid, not suggested
+      total_referrals: referrals.length,
+      pending_count: pending.length,
+      paid_count: paid.length,
+      total_commission: sum(referrals, 'commission_amount'),
+      pending_commission: sum(pending, 'commission_amount'),
+      paid_commission: sum(paid, 'amount_paid'),   // actual paid, not suggested
     }
- 
+
     // ── By referrer ───────────────────────────────────────────────────────────
     // Groups referrals by referrer_name, computes per-doctor totals
     const referrerMap = {}
@@ -2480,12 +2710,12 @@ module.exports.getReferrals = async (req, res) => {
       const key = r.referrer_name
       if (!referrerMap[key]) {
         referrerMap[key] = {
-          referrer_name:       key,
-          referrer_phone:      r.referrer_phone,
-          total_referrals:     0,
-          total_commission:    0,
-          pending_commission:  0,
-          paid_commission:     0,
+          referrer_name: key,
+          referrer_phone: r.referrer_phone,
+          total_referrals: 0,
+          total_commission: 0,
+          pending_commission: 0,
+          paid_commission: 0,
         }
       }
       referrerMap[key].total_referrals++
@@ -2496,30 +2726,17 @@ module.exports.getReferrals = async (req, res) => {
         referrerMap[key].paid_commission += r.amount_paid ?? r.commission_amount
       }
     }
- 
+
     const by_referrer = Object.values(referrerMap)
       .sort((a, b) => b.pending_commission - a.pending_commission)
- 
+
     return res.json({ referrals, stats, by_referrer })
   } catch (err) {
     console.error('getReferrals:', err.message)
     return res.status(500).json({ error: 'Failed to fetch referrals' })
   }
 }
- 
-// ─── POST /api/admin/referrals ────────────────────────────────────────────────
-// Creates a referral record. Called when reception registers a direct_lab
-// visit that came via an referral.
-//
-// Body:
-//   visit_id          Int      required
-//   referrer_name     String   required
-//   referrer_phone    String?
-//   test_ordered      String   required  — the test name
-//   test_cost         Int      required  — cost in KES
-//   commission_rate   Float?   default 0.1
-//   notes             String?
-//   referred_at       DateTime? default now()
+
 module.exports.createReferral = async (req, res) => {
   const {
     visit_id,
@@ -2531,29 +2748,29 @@ module.exports.createReferral = async (req, res) => {
     notes,
     referred_at,
   } = req.body
- 
+
   // Validation
-  if (!visit_id)          return res.status(400).json({ error: 'visit_id is required' })
+  if (!visit_id) return res.status(400).json({ error: 'visit_id is required' })
   if (!referrer_name?.trim()) return res.status(400).json({ error: 'referrer_name is required' })
   if (!test_ordered?.trim()) return res.status(400).json({ error: 'test_ordered is required' })
   if (!test_cost || isNaN(Number(test_cost)) || Number(test_cost) <= 0) {
     return res.status(400).json({ error: 'test_cost must be a positive number' })
   }
- 
-  const cost   = Number(test_cost)
-  const rate   = Math.min(1, Math.max(0, Number(commission_rate) || 0.1))
+
+  const cost = Number(test_cost)
+  const rate = Math.min(1, Math.max(0, Number(commission_rate) || 0.1))
   const amount = Math.round(cost * rate)
- 
+
   try {
     // Confirm the visit exists and is a direct_lab visit
     const visit = await prisma.visit.findUnique({
       where: { id: Number(visit_id) },
     })
- 
+
     if (!visit) {
       return res.status(404).json({ error: 'Visit not found' })
     }
- 
+
     // Check no referral already exists for this visit
     const existing = await prisma.Referral.findUnique({
       where: { visit_id: Number(visit_id) },
@@ -2561,19 +2778,16 @@ module.exports.createReferral = async (req, res) => {
     if (existing) {
       return res.status(409).json({ error: 'A referral already exists for this visit' })
     }
- 
+
     const referral = await prisma.Referral.create({
       data: {
-        visit_id:          Number(visit_id),
-        referrer_name:     referrer_name.trim(),
-        referrer_phone:    referrer_phone?.trim() ?? null,
-        test_ordered:      test_ordered.trim(),
-        test_cost:         cost,
-        commission_rate:   rate,
+        visit_id: Number(visit_id),
+        referrer_name: referrer_name.trim(),
+        referrer_phone: referrer_phone?.trim() ?? null,
         commission_amount: amount,
-        notes:             notes?.trim() ?? null,
-        referred_at:       referred_at ? new Date(referred_at) : new Date(),
-        status:            'pending',
+        notes: notes?.trim() ?? null,
+        referred_at: referred_at ? new Date(referred_at) : new Date(),
+        status: 'pending',
       },
       include: {
         visit: {
@@ -2583,7 +2797,7 @@ module.exports.createReferral = async (req, res) => {
         },
       },
     })
- 
+
     return res.status(201).json({ referral: shapeReferral(referral) })
   } catch (err) {
     if (err.code === 'P2002') {
@@ -2593,47 +2807,39 @@ module.exports.createReferral = async (req, res) => {
     return res.status(500).json({ error: 'Failed to create referral' })
   }
 }
- 
-// ─── PATCH /api/admin/referrals/:id/pay ──────────────────────────────────────
-// Marks a referral commission as paid.
-//
-// Body:
-//   paid_by      String   required — username of admin recording the payment
-//   amount_paid  Int      required — actual amount paid in KES
+
 module.exports.payReferral = async (req, res) => {
   const referralId = Number(req.params.id)
+  const currentUser = req.user
   if (!Number.isInteger(referralId)) {
     return res.status(400).json({ error: 'Invalid referral id' })
   }
- 
-  const { paid_by, amount_paid } = req.body
- 
-  if (!paid_by?.trim()) {
-    return res.status(400).json({ error: 'paid_by is required' })
-  }
+
+  const { amount_paid, notes } = req.body
   if (!amount_paid || isNaN(Number(amount_paid)) || Number(amount_paid) <= 0) {
     return res.status(400).json({ error: 'amount_paid must be a positive number' })
   }
- 
+
   try {
     const referral = await prisma.Referral.findUnique({
       where: { id: referralId },
     })
- 
+
     if (!referral) {
       return res.status(404).json({ error: 'Referral not found' })
     }
     if (referral.status === 'paid') {
       return res.status(409).json({ error: 'This referral has already been marked as paid' })
     }
- 
+
     const updated = await prisma.Referral.update({
       where: { id: referralId },
       data: {
-        status:      'paid',
-        paid_by:     paid_by.trim(),
-        amount_paid: Math.round(Number(amount_paid)),
-        paid_at:     new Date(),
+        status: 'paid',
+        paid_by: currentUser.username,
+        commission_amount: Math.round(Number(amount_paid)),
+        paid_at: new Date(),
+        notes
       },
       include: {
         visit: {
@@ -2643,7 +2849,16 @@ module.exports.payReferral = async (req, res) => {
         },
       },
     })
- 
+     await writeAuditLog({
+      staffId: currentUser.id,
+      user: currentUser.username,
+      action: 'commission paid',
+      description: `commision paid for visit ${updated.visit.id})`,
+      category: 'referral',
+      entity: 'referral',
+      entityId: referral.id,
+      ipAddress: req.ip ?? req.headers['x-forwarded-for'] ?? null,
+    })
     return res.json({ referral: shapeReferral(updated) })
   } catch (err) {
     if (err.code === 'P2025') {
@@ -2651,5 +2866,581 @@ module.exports.payReferral = async (req, res) => {
     }
     console.error('payReferral:', err.message)
     return res.status(500).json({ error: 'Failed to mark referral as paid' })
+  }
+}
+
+module.exports.getFinanceOverview = async (req, res) => {
+  try {
+    const { from, to } = req.query
+    if (!from || !to) {
+      return res.status(400).json({ error: 'from and to dates are required' })
+    }
+    const { fromDate, toDate } = parseDateRange(from, to)
+
+    const [
+      paymentAgg,
+      billAgg,
+      clinicExpSum,
+      pharmacyExpSum,
+      clinicExpByCat,
+      pharmacyExpByCat,
+    ] = await Promise.all([
+      prisma.payment.groupBy({
+        by: ['method'],
+        where: { paid_at: { gte: fromDate, lte: toDate } },
+        _sum: { amount: true },
+      }),
+      prisma.bill.aggregate({
+        where: { created_at: { gte: fromDate, lte: toDate } },
+        _sum: {
+          consultation_fee: true,
+          lab_fee: true,
+          medication_fee: true,
+          procedure_fee: true,
+        },
+      }),
+      prisma.clinicExpense.aggregate({
+        where: { incurred_at: { gte: fromDate, lte: toDate } },
+        _sum: { amount: true },
+      }),
+      prisma.pharmacyExpense.aggregate({
+        where: { incurred_at: { gte: fromDate, lte: toDate } },
+        _sum: { amount: true },
+      }),
+      prisma.clinicExpense.groupBy({
+        by: ['category'],
+        where: { incurred_at: { gte: fromDate, lte: toDate } },
+        _sum: { amount: true },
+      }),
+      prisma.pharmacyExpense.groupBy({
+        by: ['category'],
+        where: { incurred_at: { gte: fromDate, lte: toDate } },
+        _sum: { amount: true },
+      }),
+    ])
+
+    const byPaymentMethod = { cash: 0, mpesa: 0, insurance: 0, other: 0 }
+    let totalRevenue = 0
+    for (const p of paymentAgg) {
+      const amt = p._sum.amount || 0
+      totalRevenue += amt
+      if (byPaymentMethod.hasOwnProperty(p.method)) {
+        byPaymentMethod[p.method] += amt
+      } else {
+        byPaymentMethod.other += amt
+      }
+    }
+
+    const clinicTotal = clinicExpSum._sum.amount || 0
+    const pharmacyTotal = pharmacyExpSum._sum.amount || 0
+    const totalExpenses = clinicTotal + pharmacyTotal
+
+    const byCategory = {}
+    for (const g of [...clinicExpByCat, ...pharmacyExpByCat]) {
+      const key = g.category || 'uncategorized'
+      byCategory[key] = (byCategory[key] || 0) + (g._sum.amount || 0)
+    }
+
+    const daysInRange = Math.max(1, Math.round((toDate - fromDate) / (1000 * 60 * 60 * 24)))
+
+    res.json({
+      revenue: {
+        total: totalRevenue,
+        consultation: billAgg._sum.consultation_fee || 0,
+        procedures: billAgg._sum.procedure_fee || 0,
+        lab: billAgg._sum.lab_fee || 0,
+        medication: billAgg._sum.medication_fee || 0,
+      },
+      by_payment_method: byPaymentMethod,
+      expenses: {
+        total: totalExpenses,
+        by_department: {
+          reception: clinicTotal,
+          pharmacy: pharmacyTotal,
+        },
+        by_category: byCategory,
+      },
+      days_in_range: daysInRange,
+      net: totalRevenue - totalExpenses,
+    })
+  } catch (err) {
+    console.error('Finance overview error:', err)
+    res.status(500).json({ error: 'Failed to load finance overview' })
+  }
+}
+
+// ─── 2. Outstanding Balances ─────────────────────────────────────────────────
+
+// GET /api/admin/outstanding-balances
+module.exports.getOutstandingBalances = async (req, res) => {
+  try {
+    const { from, to } = req.query
+    if (!from || !to) {
+      return res.status(400).json({ error: 'from and to dates are required' })
+    }
+    const { fromDate, toDate } = parseDateRange(from, to)
+    const { page, limit, offset } = getPagination(req)
+
+    // ── Clinic: bills created in period that still have a balance ──
+    const clinicRows = await prisma.$queryRaw`
+      SELECT 
+        'clinic' as source,
+        b.visit_id as entity_id,
+        p.id AS patient_id,
+        p.name AS patient_name,
+        p.phone AS patient_phone,
+        b.total_amount AS total_bill,
+        COALESCE(SUM(py.amount), 0)::int AS paid_amount,
+        b.discount_amount AS waived_amount,
+        (b.total_amount - COALESCE(SUM(py.amount), 0) - b.discount_amount)::int AS balance,
+        v.arrived_at as created_at
+      FROM bills b
+      JOIN visits v ON v.id = b.visit_id
+      JOIN patients p ON p.id = v.patient_id
+      LEFT JOIN payments py ON py.bill_id = b.id
+      WHERE b.created_at >= ${fromDate} AND b.created_at <= ${toDate}
+      GROUP BY b.id, v.id, p.id, p.name, p.phone, b.total_amount, b.discount_amount, v.arrived_at
+      HAVING b.total_amount - COALESCE(SUM(py.amount), 0) - b.discount_amount > 0
+      ORDER BY balance DESC
+    `
+
+    // ── Pharmacy: customers with credit sales in period and current balance > 0 ──
+    const pharmacyCustomers = await prisma.pharmacyCustomer.findMany({
+      where: {
+        sales: {
+          some: {
+            payment_method: 'credit',
+            sold_at: { gte: fromDate, lte: toDate },
+          },
+        },
+      },
+      include: {
+        sales: {
+          where: { payment_method: 'credit' },
+          select: { total: true, sold_at: true },
+        },
+        payments: {
+          select: { amount: true, method: true, reference: true, created_at: true },
+        },
+      },
+      orderBy: { name: 'asc' },
+    })
+
+    const pharmacyRows = pharmacyCustomers
+      .map((c) => {
+        const totalCredit = c.sales.reduce((s, sale) => s + sale.total, 0)
+        const totalPaid = c.payments
+          .filter((p) => p.method !== 'waiver')
+          .reduce((s, p) => s + p.amount, 0)
+        const totalWaived = c.payments
+          .filter((p) => p.method === 'waiver')
+          .reduce((s, p) => s + p.amount, 0)
+        const balance = totalCredit - totalPaid - totalWaived
+        if (balance <= 0) return null
+
+        return {
+          source: 'pharmacy',
+          entity_id: c.id,
+          patient_id: c.id,
+          patient_name: c.name,
+          patient_phone: c.phone,
+          total_bill: totalCredit,
+          paid_amount: totalPaid,
+          waived_amount: totalWaived,
+          balance,
+          created_at: c.sales[0]?.sold_at || new Date(),
+        }
+      })
+      .filter(Boolean)
+
+    // ── Merge, sort by balance desc, paginate in-memory ──
+    const all = [...clinicRows, ...pharmacyRows].sort((a, b) => b.balance - a.balance)
+    const total = all.length
+    const outstanding = all.slice(offset, offset + limit)
+    const totalOutstanding = all.reduce((s, r) => s + (r.balance || 0), 0)
+
+    res.json({
+      outstanding,
+      total_outstanding: totalOutstanding,
+      count: total,
+      page,
+      pages: Math.max(1, Math.ceil(total / limit)),
+      total,
+    })
+  } catch (err) {
+    console.error('Outstanding balances error:', err)
+    res.status(500).json({ error: 'Failed to load outstanding balances' })
+  }
+}
+
+// PATCH /api/admin/outstanding-balances/:id
+module.exports.updateOutstandingBalance = async (req, res) => {
+  try {
+    const entityId = Number(req.params.visitId)
+    const { source, action, amount, method, reference, reason } = req.body
+
+    if (!source || !['clinic', 'pharmacy'].includes(source)) {
+      return res.status(400).json({ error: 'source must be clinic or pharmacy' })
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // PHARMACY
+    // ═══════════════════════════════════════════════════════════
+    if (source === 'pharmacy') {
+      const customerId = entityId
+
+      if (action === 'settle') {
+        const settleAmount = Number(amount)
+        if (!Number.isFinite(settleAmount) || settleAmount <= 0) {
+          return res.status(400).json({ error: 'Invalid settlement amount' })
+        }
+
+        const result = await prisma.$transaction(async (tx) => {
+          const customer = await tx.pharmacyCustomer.findUnique({
+            where: { id: customerId },
+            include: {
+              sales: { where: { payment_method: 'credit' }, select: { total: true } },
+              payments: true,
+            },
+          })
+          if (!customer) throw Object.assign(new Error('Customer not found'), { status: 404 })
+
+          const totalCredit = customer.sales.reduce((s, sale) => s + sale.total, 0)
+          const totalPaid = customer.payments
+            .filter((p) => p.method !== 'waiver')
+            .reduce((s, p) => s + p.amount, 0)
+          const totalWaived = customer.payments
+            .filter((p) => p.method === 'waiver')
+            .reduce((s, p) => s + p.amount, 0)
+          const balance = totalCredit - totalPaid - totalWaived
+
+          if (balance <= 0) throw Object.assign(new Error('Customer has no outstanding balance'), { status: 400 })
+          if (settleAmount > balance) throw Object.assign(new Error(`Amount exceeds balance of ${balance}`), { status: 400, meta: { balance } })
+
+          await tx.customerPayment.create({
+            data: {
+              customer_id: customerId,
+              amount: Math.round(settleAmount),
+              method: method || 'cash',
+              reference: reference || null,
+              staff_id: req.user?.id || null,
+            },
+          })
+
+          return { customer, totalCredit, totalPaid: totalPaid + settleAmount, totalWaived, newBalance: balance - settleAmount }
+        })
+
+        return res.json({
+          row: {
+            source: 'pharmacy',
+            entity_id: customerId,
+            patient_id: customerId,
+            patient_name: result.customer.name,
+            patient_phone: result.customer.phone,
+            total_bill: result.totalCredit,
+            paid_amount: result.totalPaid,
+            waived_amount: result.totalWaived,
+            balance: result.newBalance,
+          },
+        })
+      }
+
+      if (action === 'waive') {
+        if (!reason?.trim()) {
+          return res.status(400).json({ error: 'Reason is required for waiver' })
+        }
+
+        const result = await prisma.$transaction(async (tx) => {
+          const customer = await tx.pharmacyCustomer.findUnique({
+            where: { id: customerId },
+            include: {
+              sales: { where: { payment_method: 'credit' }, select: { total: true } },
+              payments: true,
+            },
+          })
+          if (!customer) throw Object.assign(new Error('Customer not found'), { status: 404 })
+
+          const totalCredit = customer.sales.reduce((s, sale) => s + sale.total, 0)
+          const totalPaid = customer.payments
+            .filter((p) => p.method !== 'waiver')
+            .reduce((s, p) => s + p.amount, 0)
+          const totalWaived = customer.payments
+            .filter((p) => p.method === 'waiver')
+            .reduce((s, p) => s + p.amount, 0)
+          const balance = totalCredit - totalPaid - totalWaived
+
+          const waiveAmt =
+            Number.isFinite(Number(amount)) && Number(amount) > 0 && Number(amount) < balance
+              ? Number(amount)
+              : balance
+
+          await tx.customerPayment.create({
+            data: {
+              customer_id: customerId,
+              amount: Math.round(waiveAmt),
+              method: 'waiver',
+              reference: reason.trim(),
+              staff_id: req.user?.id || null,
+            },
+          })
+
+          return { customer, totalCredit, totalPaid, totalWaived: totalWaived + waiveAmt, newBalance: balance - waiveAmt }
+        })
+
+        return res.json({
+          row: {
+            source: 'pharmacy',
+            entity_id: customerId,
+            patient_id: customerId,
+            patient_name: result.customer.name,
+            patient_phone: result.customer.phone,
+            total_bill: result.totalCredit,
+            paid_amount: result.totalPaid,
+            waived_amount: result.totalWaived,
+            balance: result.newBalance,
+          },
+        })
+      }
+
+      return res.status(400).json({ error: 'Invalid action' })
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // CLINIC (your existing logic, untouched except param name)
+    // ═══════════════════════════════════════════════════════════
+    const visitId = entityId
+
+    const bill = await prisma.bill.findUnique({
+      where: { visit_id: visitId },
+      include: {
+        payments: true,
+        visit: {
+          include: {
+            patient: { select: { id: true, name: true, phone: true } },
+          },
+        },
+      },
+    })
+
+    if (!bill) return res.status(404).json({ error: 'Bill not found' })
+
+    const paidAmount = bill.payments.reduce((s, p) => s + p.amount, 0)
+    const currentBalance = Math.max(0, bill.total_amount - paidAmount - bill.discount_amount)
+
+    if (action === 'settle') {
+      const settleAmount = Number(amount)
+      if (!Number.isFinite(settleAmount) || settleAmount <= 0 || settleAmount > currentBalance) {
+        return res.status(400).json({ error: 'Invalid settlement amount' })
+      }
+
+      await prisma.payment.create({
+        data: {
+          bill_id: bill.id,
+          amount: Math.round(settleAmount),
+          method: method || 'cash',
+          reference: reference || null,
+          stage: 2,
+          cashier_id: req.user?.id || null,
+        },
+      })
+
+      const newPaid = paidAmount + settleAmount
+      const newBalance = Math.max(0, bill.total_amount - newPaid - bill.discount_amount)
+      const newStatus = newBalance <= 0 ? 'paid' : bill.fee_status
+
+      if (newStatus !== bill.fee_status) {
+        await prisma.bill.update({ where: { id: bill.id }, data: { fee_status: newStatus } })
+      }
+
+      return res.json({
+        row: {
+          source: 'clinic',
+          entity_id: visitId,
+          patient_id: bill.visit.patient.id,
+          patient_name: bill.visit.patient.name,
+          patient_phone: bill.visit.patient.phone,
+          total_bill: bill.total_amount,
+          paid_amount: newPaid,
+          waived_amount: bill.discount_amount,
+          balance: newBalance,
+        },
+      })
+    }
+
+    if (action === 'waive') {
+      if (!reason?.trim()) return res.status(400).json({ error: 'Reason is required for waiver' })
+
+      const waiveAmount =
+        Number.isFinite(Number(amount)) && Number(amount) > 0 && Number(amount) < currentBalance
+          ? Number(amount)
+          : currentBalance
+
+      const newDiscount = bill.discount_amount + waiveAmount
+      const newBalance = Math.max(0, bill.total_amount - paidAmount - newDiscount)
+      const newStatus = newBalance <= 0 ? 'waived' : bill.fee_status
+
+      await prisma.bill.update({
+        where: { id: bill.id },
+        data: {
+          discount_amount: newDiscount,
+          discount_reason: reason.trim(),
+          fee_status: newStatus,
+        },
+      })
+
+      return res.json({
+        row: {
+          source: 'clinic',
+          entity_id: visitId,
+          patient_id: bill.visit.patient.id,
+          patient_name: bill.visit.patient.name,
+          patient_phone: bill.visit.patient.phone,
+          total_bill: bill.total_amount,
+          paid_amount: paidAmount,
+          waived_amount: newDiscount,
+          balance: newBalance,
+        },
+      })
+    }
+
+    res.status(400).json({ error: 'Invalid action' })
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message, ...err.meta })
+    console.error('Update outstanding error:', err)
+    res.status(500).json({ error: 'Failed to update balance' })
+  }
+}
+
+exports.getDebtBook = async (req, res) => {
+  try {
+    const customers = await prisma.pharmacyCustomer.findMany({
+      where: {
+        sales: { some: { payments: { some: { method: 'credit' } } } },
+      },
+      include: {
+        sales: {
+          where: { payments: { some: { method: 'credit' } } },
+          include: { payments: { where: { method: 'credit' } } },
+        },
+        payments: true,
+      },
+      orderBy: { name: 'asc' },
+    })
+
+    const debtors = customers
+      .map((c) => {
+        const totalCredit = c.sales.reduce((sum, sale) => {
+          const creditAmount = sale.payments
+            .filter((p) => p.method === 'credit')
+            .reduce((s, p) => s + p.amount, 0)
+          return sum + creditAmount
+        }, 0)
+
+        const totalPaid = c.payments.reduce((sum, p) => sum + p.amount, 0)
+        const balance = totalCredit - totalPaid
+
+        return {
+          id: c.id,
+          name: c.name,
+          phone: c.phone,
+          total_credit: totalCredit,
+          total_paid: totalPaid,
+          balance,
+          last_sale: c.sales.at(-1)?.sold_at,
+        }
+      })
+      .filter((d) => d.balance > 0)
+
+    res.json({
+      debtors,
+      stats: {
+        count: debtors.length,
+        total_outstanding: debtors.reduce((s, d) => s + d.balance, 0),
+      },
+    })
+  } catch (err) {
+    console.error('getDebtBook', err)
+    res.status(500).json({ error: 'Failed to load debt book' })
+  }
+}
+
+// ─── COLLECT PAYMENT (admin/cashier) ──────────────────────────────────────────
+
+exports.collectCustomerPayment = async (req, res) => {
+  const currentUser = req.user
+  const { customer_id, amount, method, reference } = req.body
+
+  const customerId = parseInt(customer_id)
+  const payAmount = parseInt(amount)
+
+  if (!Number.isInteger(customerId)) {
+    return res.status(400).json({ error: 'customer_id required' })
+  }
+  if (!Number.isInteger(payAmount) || payAmount <= 0) {
+    return res.status(400).json({ error: 'Amount must be a positive whole number' })
+  }
+
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      const customer = await tx.pharmacyCustomer.findUnique({
+        where: { id: customerId },
+        include: {
+          sales: { include: { payments: { where: { method: 'credit' } } } },
+          payments: true,
+        },
+      })
+      if (!customer) throw Object.assign(new Error('Customer not found'), { status: 404 })
+
+      const totalCredit = customer.sales.reduce(
+        (sum, sale) => sum + sale.payments.reduce((s, p) => s + p.amount, 0),
+        0
+      )
+      const totalPaid = customer.payments.reduce((sum, p) => sum + p.amount, 0)
+      const balance = totalCredit - totalPaid
+
+      if (balance <= 0) {
+        throw Object.assign(new Error('Customer has no outstanding balance'), { status: 400 })
+      }
+      if (payAmount > balance) {
+        throw Object.assign(
+          new Error(`Amount exceeds balance of ${balance}`),
+          { status: 400, meta: { balance } }
+        )
+      }
+
+      const payment = await tx.customerPayment.create({
+        data: {
+          customer_id: customerId,
+          amount: payAmount,
+          method: method || 'cash',
+          reference: (typeof reference === 'string' && reference.trim()) || null,
+          staff_id: currentUser?.id,
+        },
+      })
+
+      return { customer, payment, newBalance: balance - payAmount }
+    }, { timeout: 10000 })
+
+    await writeAuditLog({
+      staffId: currentUser?.id,
+      user: currentUser?.username,
+      action: 'credit_payment',
+      description: `Collected ${payAmount} from ${result.customer.name}. Remaining: ${result.newBalance}`,
+      category: 'pharmacy_credit',
+      entity: 'pharmacy_customer',
+      entityId: customerId,
+      ipAddress: req.ip ?? null,
+    })
+
+    res.json({
+      success: true,
+      payment_id: result.payment.id,
+      customer: result.customer.name,
+      new_balance: result.newBalance,
+    })
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message, ...err.meta })
+    console.error('collectCustomerPayment', err)
+    res.status(500).json({ error: 'Failed to record payment' })
   }
 }

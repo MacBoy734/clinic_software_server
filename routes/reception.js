@@ -16,7 +16,7 @@ router.patch('/visits/:id/forward-to-billing', authenticate, authorize('receptio
 router.patch('/visits/:id/mark-done', authenticate, authorize('receptionist'), c.markDone)
 router.patch('/visits/:id/archive', authenticate, authorize('receptionist'), c.archiveVisit)
 router.patch('/visits/:id/stage1-payment', authenticate, authorize('receptionist'), c.stage1Payment)
-router.patch('/visits/:id/stage2-payment', authenticate, authorize('receptionist'), c.stage2Payment)
+router.patch('/visits/:id/waive-stage1', c.waiveStage1)
 router.patch('/payments', authenticate, authorize('receptionist'), c.collectPayment)
 
 module.exports = router

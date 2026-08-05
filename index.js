@@ -11,6 +11,9 @@ const adminRoutes = require('./routes/admin')
 
 const app = express()
 const server = http.createServer(app)
+require('./lib/cron') // ← run cron jobs
+const redis   = require('./lib/redis')   // ← import triggers connection
+const { getSettings } = require('./lib/settings')
 const PORT = process.env.PORT || 5000
 
 // ─── Init Socket.io ───────────────────────────────────────────────────────────
@@ -54,7 +57,8 @@ app.use((err, req, res, next) => {
 })
 
 // ─── Start ────────────────────────────────────────────────────────────────────
-server.listen(PORT, '0.0.0.0', () => { // ← server.listen not app.listen
+server.listen(PORT, '0.0.0.0', async () => { // ← server.listen not app.listen
+  await getSettings()
   console.log(`\n City Health Clinic Server`)
   console.log(` Running on http://localhost:${PORT}`)
   console.log(` Environment: ${process.env.NODE_ENV || 'development'}`)

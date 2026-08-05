@@ -1,44 +1,56 @@
-// server/routes/pharmacyRoutes.js
-//
-// Only the 8 endpoints the 4 pharmacy tabs actually call. Order/markup
-// settings management lives on the admin router, not here.
-
 const express = require('express')
 const router = express.Router()
-const { authorize, authenticate } = require('../middleware/auth')
+const { authenticate, authorize } = require('../middleware/auth')
 const c = require('../controllers/pharmacy_controller')
 
-router.get('/drugs',authenticate, authorize('pharmacist', 'admin', 'doctor'), c.getDrugs)
+// Everything below needs a session.
+router.use(authenticate)
 
-router.use(authenticate, authorize('pharmacist', 'admin'))
+const PHARMACY = authorize('pharmacist', 'admin')
+// Roles that raise supply orders and need to browse the catalogue.
+const REQUESTERS = authorize('pharmacist', 'admin', 'doctor', 'lab_tech',)
 
-// ─── Stock (StockTab) ─────────────────────────────────────────────────────────
-router.get('/stock', c.getStock)
-router.patch('/stock', c.restockDrug)
+// ─── Catalogue ────────────────────────────────────────────────────────────────
 
+router.get('/products', REQUESTERS, c.getProducts)
+router.get('/customers', PHARMACY, c.getCustomers)
+router.get('/categories', REQUESTERS, c.getCategories)
+router.get('/products/:id/movements', PHARMACY, c.getProductMovements)
 
-// ─── Queue (QueueTab) ─────────────────────────────────────────────────────────
-router.get('/queue', c.getQueue)
-router.patch('/prescriptions/:id/dispense', c.dispensePrescription)
-router.patch('/prescriptions/:id/cancel', c.cancelPrescription)
+// Deprecated: /drugs is pinned to category=medication so old clients work.
+router.get('/drugs', REQUESTERS, c.getDrugs)
 
-// ─── OTC Sales (OTCSalesTab) ──────────────────────────────────────────────────
-router.get('/otc-sales', c.getOtcSales)
-router.post('/otc-sales', c.createOtcSale)
+// ─── Stock table ──────────────────────────────────────────────────────────────
+// No category parameter → every category. This is the one screen that sees
+// the whole catalogue.
 
-// ─── Internal supply orders (InternalOrdersTab) ──────────────────────────────
-router.get('/orders', c.getInternalOrders)
-router.patch('/orders/:id/fulfill', c.fulfillOrder)
+router.get('/stock', PHARMACY, c.getStock)
+
+// ─── Restock requests ─────────────────────────────────────────────────────────
+// Pharmacy raises, admin approves. Nothing here touches current_stock.
+
+router.get('/restock-requests', PHARMACY, c.getRestockRequests)
+router.post('/restock-requests', PHARMACY, c.createRestockRequest)
+
+// ─── Prescription queue ───────────────────────────────────────────────────────
+
+router.get('/queue', PHARMACY, c.getQueue)
+router.patch('/prescriptions/:id/dispense', PHARMACY, c.dispensePrescription)
+router.patch('/prescriptions/:id/cancel', PHARMACY, c.cancelPrescription)
+
+// ─── OTC sales ────────────────────────────────────────────────────────────────
+
+router.get('/otc-sales', PHARMACY, c.getOtcSales)
+router.post('/otc-sales', PHARMACY, c.createOtcSale)
+
+// ─── Internal supply orders ───────────────────────────────────────────────────
+// POST is open to every requesting department; the order's department is
+// derived from the caller's ROLE inside the controller, never from the body.
+// Fulfilment and cancellation stay with the pharmacy.
+
+router.get('/orders', REQUESTERS, c.getInternalOrders)
+router.post('/orders', REQUESTERS, c.createInternalOrder)
+router.patch('/orders/:id/fulfill', PHARMACY, c.fulfillOrder)
+router.patch('/orders/:id/cancel', PHARMACY, c.cancelOrder)
 
 module.exports = router
-
-
-// ─── Mount in server/app.js ───────────────────────────────────────────────────
-//
-//   const pharmacyRoutes = require('./routes/pharmacyRoutes')
-//   app.use('/api/pharmacy', pharmacyRoutes)
-//
-// NOTE: doctor and lab's "create supply order" POST (department: 'doctor'|'lab')
-// is NOT included here since it wasn't in any of the 4 pharmacy files sent.
-// Wherever you build that endpoint, it just needs to write to the same
-// PharmacyOrder model this router reads from.

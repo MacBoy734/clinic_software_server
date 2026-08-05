@@ -47,25 +47,20 @@ function shapeVisit(v) {
     status: v.status,
     arrived_at: formatArrival(v.arrived_at),
 
-    // Referral - direct_lab only
     referred_by: v.referred_by || null,
     referrer_phone: v.referrer_phone || null,
 
-    // Patient
     patient_id: v.patient.id,
     patient_name: v.patient.name,
     phone: v.patient.phone,
     gender: v.patient.gender,
     age: v.patient.age ?? null,
 
-    // Complaint lives in notes (set at registration)
     chief_complaint: v.notes || null,
 
-    // Doctor
     doctor: v.doctor?.username || null,
     doctor_id: v.doctor?.id || null,
 
-    // Billing - safe defaults if bill missing
     consultation_fee: v.bill?.consultation_fee ?? 0,
     consultation_fee_status: v.bill?.consultation_fee_status ?? 'pending',
     lab_fee: v.bill?.lab_fee ?? 0,
@@ -75,14 +70,13 @@ function shapeVisit(v) {
     total_amount: v.bill?.total_amount ?? 0,
     fee_status: v.bill?.fee_status ?? 'pending',
 
-    // Lab
     lab_requests: v.lab_requests,
     has_lab: v.lab_requests.length > 0,
     lab_done: v.lab_requests.length > 0 && v.lab_requests.every((r) => r.status === 'ready'),
 
-    // Prescriptions
     has_prescription: v.prescriptions.length > 0,
-    rx_dispensed: v.prescriptions.length > 0 && v.prescriptions.every((p) => p.status === 'dispensed'),
+    // FIX: pharmacy sets status to 'issued', not 'dispensed'
+    rx_dispensed: v.prescriptions.length > 0 && v.prescriptions.every((p) => p.status === 'issued' || p.status === 'dispensed'),
   }
 }
 
@@ -119,11 +113,17 @@ module.exports.getVisits = async (req, res) => {
 
 module.exports.getQueue = async (req, res) => {
   try {
+    const { status } = req.query
+    const where = {
+      arrived_at: todayRange(),
+      status: { notIn: ['archived'] }
+    }
+    if (status && status !== 'all') {
+      where.status = status
+    }
+
     const visits = await prisma.visit.findMany({
-      where: {
-        arrived_at: todayRange(),
-        status: { notIn: ['archived'] }
-      },
+      where,
       include: VISIT_INCLUDE,
       orderBy: [{ queue_number: 'asc' }, { arrived_at: 'asc' }],
     })
@@ -210,11 +210,6 @@ module.exports.getChargeTemplates = async (req, res) => {
   }
 }
 
-// ─── GET /api/reception/bills ─────────────────────────────────────────────────
-// FIXED: previous version fetched payments with take:1 select:{method} but then
-// summed p.amount — amount was never selected, so paid_amount was NaN for every
-// bill with a payment. Now fetches ALL payments with full fields; this is also
-// what the ReceiptModal needs to render payment history.
 module.exports.getBills = async (req, res) => {
   try {
     const bills = await prisma.bill.findMany({
@@ -243,7 +238,6 @@ module.exports.getBills = async (req, res) => {
     })
 
     const shaped = bills.map((b) => {
-      // Build itemized breakdown
       const items = [
         b.consultation_fee > 0 && { name: 'Consultation fee', amount: b.consultation_fee },
         b.lab_fee > 0 && { name: 'Lab fees', amount: b.lab_fee },
@@ -251,9 +245,10 @@ module.exports.getBills = async (req, res) => {
         b.procedure_fee > 0 && { name: 'Procedure fee', amount: b.procedure_fee },
       ].filter(Boolean)
 
-      // Total paid = sum of all payments
       const paid_amount = b.payments.reduce((sum, p) => sum + p.amount, 0)
       const lastPayment = b.payments[b.payments.length - 1]
+      const discount_amount = b.discount_amount || 0
+      const payable_amount = b.total_amount - discount_amount
 
       return {
         id: b.id,
@@ -264,10 +259,12 @@ module.exports.getBills = async (req, res) => {
         patient_id: b.visit.patient.id,
         items,
         total_amount: b.total_amount,
+        discount_amount,
+        discount_reason: b.discount_reason || null,
+        payable_amount,
         paid_amount,
         status: b.fee_status,
         method: lastPayment?.method ?? null,
-        // Full payment history — consumed by ReceiptModal
         payments: b.payments.map((p) => ({
           amount: p.amount,
           method: p.method,
@@ -531,18 +528,15 @@ module.exports.stage1Payment = async (req, res) => {
   if (!id) return res.status(400).json({ error: 'Visit ID is required' })
   if (!amount || !method) return res.status(400).json({ error: 'Amount and method are required' })
 
-  // Declare visit here so it's accessible outside the transaction
   let visit
 
   try {
     const result = await prisma.$transaction(async (tx) => {
-      // Assign to outer visit so it's accessible after the transaction
       visit = await tx.visit.findUnique({
         where: { id: Number(id) },
         include: { bill: true, patient: { select: { name: true } } },
       })
 
-      // Throw instead of returning — this aborts the transaction cleanly
       if (!visit) throw Object.assign(new Error('Visit not found'), { status: 404 })
       if (!visit.bill) throw Object.assign(new Error('No bill found for this visit'), { status: 404 })
 
@@ -569,9 +563,7 @@ module.exports.stage1Payment = async (req, res) => {
         data: {
           consultation_fee_status: 'paid',
           consultation_fee_status_paid_at: new Date(),
-          total_amount: {
-            increment: Number(amount),
-          },
+          // FIX: do NOT increment total_amount by the payment
         },
       })
 
@@ -583,8 +575,6 @@ module.exports.stage1Payment = async (req, res) => {
       return { bill: updatedBill }
     })
 
-    // Post-commit side effects — payment is durable; nothing here may fail
-    // the request.
     const patientName = visit?.patient?.name ?? 'Unknown'
 
     try {
@@ -617,69 +607,10 @@ module.exports.stage1Payment = async (req, res) => {
     return res.json({ message: 'Stage 1 payment recorded', bill: result.bill })
 
   } catch (error) {
-    // Handle known errors thrown from inside the transaction
     if (error.status) {
       return res.status(error.status).json({ error: error.message })
     }
     console.error('stage1Payment error:', error)
-    return res.status(500).json({ error: 'Failed to record payment' })
-  }
-}
-
-// ─── PATCH /api/reception/visits/:id/stage2-payment ──────────────────────────
-// NOTE: BillingTab uses collectPayment (PATCH /api/reception/payments) for
-// stage 2, not this route. Keep only one of these long-term or they will drift.
-
-module.exports.stage2Payment = async (req, res) => {
-  const { id } = req.params
-  const { amount, method, reference } = req.body
-  const cashier_id = req.user?.id
-
-  if (!amount || !method) {
-    return res.status(400).json({ error: 'Amount and method are required' })
-  }
-
-  try {
-    const result = await prisma.$transaction(async (tx) => {
-      const visit = await tx.visit.findUnique({
-        where: { id: Number(id) },
-        include: { bill: true }
-      })
-      if (!visit) return { error: 'Visit not found', status: 404 }
-      if (!visit.bill) return { error: 'No bill found', status: 400 }
-
-      await tx.payment.create({
-        data: {
-          bill_id: visit.bill.id,
-          cashier_id,
-          amount,
-          method,
-          reference,
-          stage: 2,
-        }
-      })
-
-      const updated = await tx.bill.update({
-        where: { id: visit.bill.id },
-        data: {
-          stage2_status: 'paid',
-          stage2_paid_at: new Date(),
-          fee_status: 'paid',
-        }
-      })
-
-      await tx.visit.update({
-        where: { id: Number(id) },
-        data: { status: 'done' }
-      })
-
-      return updated
-    })
-
-    if (result.error) return res.status(result.status).json({ error: result.error })
-    return res.json({ message: 'Stage 2 payment recorded', bill: result })
-  } catch (error) {
-    console.error('stage2Payment error:', error)
     return res.status(500).json({ error: 'Failed to record payment' })
   }
 }
@@ -702,143 +633,237 @@ async function updateVisitStatus(req, res, status) {
 }
 
 // ─── PATCH /api/reception/payments ────────────────────────────────────────────
+const PAYMENT_METHODS = ['cash', 'mpesa', 'insurance', 'other']
+function normalizePayments(body) {
+  // Split form
+  if (Array.isArray(body.payments)) {
+    return body.payments.map((p) => ({
+      method: p.method,
+      amount: Number(p.amount),
+      reference: typeof p.reference === 'string' && p.reference.trim() ? p.reference.trim() : null,
+    }))
+  }
+  // Legacy single form
+  if (body.amount && body.method) {
+    return [{
+      method: body.method,
+      amount: Number(body.amount),
+      reference: typeof body.reference === 'string' && body.reference.trim() ? body.reference.trim() : null,
+    }]
+  }
+  return []
+}
 
 module.exports.collectPayment = async (req, res) => {
-  const { visit_id, amount, method, reference, stage } = req.body
+  const { visit_id, stage } = req.body
   const ip = req.ip ?? null
   const currentUser = req.user
   const io = getIO()
 
-  if (!visit_id || !amount || !method || !stage) {
-    return res.status(400).json({
-      error: 'visit_id, amount, method and stage are required',
-    })
+  if (!visit_id || !stage) {
+    return res.status(400).json({ error: 'visit_id and stage are required' })
   }
-
   if (![1, 2].includes(Number(stage))) {
     return res.status(400).json({ error: 'stage must be 1 or 2' })
   }
 
+  // ── Validate payment lines ─────────────────────────────────────────────────
+  const lines = normalizePayments(req.body)
+  if (!lines.length) {
+    return res.status(400).json({ error: 'Provide at least one payment (payments[] or amount+method)' })
+  }
+  for (const [idx, p] of lines.entries()) {
+    if (!PAYMENT_METHODS.includes(p.method)) {
+      return res.status(400).json({ error: `Payment ${idx + 1}: invalid method '${p.method}'` })
+    }
+    if (!Number.isInteger(p.amount) || p.amount <= 0) {
+      return res.status(400).json({ error: `Payment ${idx + 1}: amount must be a positive whole number (KSh)` })
+    }
+  }
+  const paymentsSum = lines.reduce((s, p) => s + p.amount, 0)
+
+  // ── Validate discount (stage 2 only) ───────────────────────────────────────
+  const discount = Number(req.body.discount_amount) || 0
+  const discountReason = typeof req.body.discount_reason === 'string' && req.body.discount_reason.trim()
+    ? req.body.discount_reason.trim()
+    : null
+  if (discount < 0 || !Number.isInteger(discount)) {
+    return res.status(400).json({ error: 'discount_amount must be a non-negative whole number' })
+  }
+  if (Number(stage) === 1 && discount > 0) {
+    return res.status(400).json({ error: 'Discounts are applied at stage 2 (billing desk), not at consultation payment' })
+  }
+  if (discount > 0 && !discountReason) {
+    return res.status(400).json({ error: 'A reason is required when applying a discount' })
+  }
+
   try {
-    const visit = await prisma.visit.findUnique({
-      where: { id: Number(visit_id) },
-      include: { bill: true, patient: true },
-    })
+    const result = await prisma.$transaction(async (tx) => {
+      const httpError = (message, status = 400) =>
+        Object.assign(new Error(message), { status })
 
-    if (!visit) return res.status(404).json({ error: 'Visit not found' })
-    if (!visit.bill) return res.status(404).json({ error: 'No bill found for this visit' })
+      // Fresh read INSIDE the transaction — guards double-collection races.
+      const visit = await tx.visit.findUnique({
+        where: { id: Number(visit_id) },
+        include: {
+          bill: { include: { payments: { select: { amount: true } } } },
+          patient: { select: { name: true } },
+        },
+      })
 
-    const bill = visit.bill
-    const cashierId = req.user?.userId || null
-    const now = new Date()
+      if (!visit) throw httpError('Visit not found', 404)
+      if (!visit.bill) throw httpError('No bill found for this visit', 404)
 
-    // ── Stage 1 ──────────────────────────────────────────────────────────────
-    if (Number(stage) === 1) {
-      if (bill.consultation_fee_status === 'paid') {
-        return res.status(409).json({ error: 'Stage 1 payment already collected' })
-      }
+      const bill = visit.bill
+      const cashierId = currentUser?.id ?? null
+      const now = new Date()
+      const alreadyPaid = bill.payments.reduce((s, p) => s + p.amount, 0)
 
-      // If no stage 2 charges exist yet, mark overall as paid immediately
-      const stage2Total = bill.lab_fee + bill.medication_fee + bill.procedure_fee
-      const overallStatus = stage2Total === 0 ? 'paid' : 'pending'
+      // ── Stage 1 — consultation fee, exact amount ─────────────────────────
+      if (Number(stage) === 1) {
+        if (bill.consultation_fee_status === 'paid') {
+          throw httpError('Stage 1 payment already collected', 409)
+        }
+        if (paymentsSum !== bill.consultation_fee) {
+          throw httpError(
+            `Payments (${paymentsSum}) must equal the consultation fee (${bill.consultation_fee})`
+          )
+        }
 
-      await prisma.$transaction([
-        prisma.payment.create({
-          data: {
+        const stage2Total = bill.lab_fee + bill.medication_fee + bill.procedure_fee
+        const overallStatus = stage2Total === 0 ? 'paid' : 'pending'
+
+        await tx.payment.createMany({
+          data: lines.map((p) => ({
             bill_id: bill.id,
             cashier_id: cashierId,
-            amount: Number(amount),
-            method,
-            reference: reference || null,
+            amount: p.amount,
+            method: p.method,
+            reference: p.reference,
             stage: 1,
             paid_at: now,
-          },
-        }),
+          })),
+        })
 
-        prisma.bill.update({
+        await tx.bill.update({
           where: { id: bill.id },
           data: {
             consultation_fee_status: 'paid',
             consultation_fee_status_paid_at: now,
             fee_status: overallStatus,
           },
-        }),
+        })
 
-        prisma.visit.update({
+        await tx.visit.update({
           where: { id: Number(visit_id) },
           data: { status: 'consultation_paid' },
-        }),
-      ])
+        })
 
-      return res.json({
-        success: true,
-        next_status: 'consultation_paid',
-        message: 'Stage 1 payment collected — patient ready for doctor',
-      })
-    }
+        return { stage: 1, visit, next_status: 'consultation_paid' }
+      }
 
-    // ── Stage 2 ──────────────────────────────────────────────────────────────
-    if (bill.stage2_status === 'paid') {
-      return res.status(409).json({ error: 'Stage 2 payment already collected' })
-    }
+      // ── Stage 2 — remaining balance, minus discount, split allowed ───────
+      if (bill.stage2_status === 'paid') {
+        throw httpError('Stage 2 payment already collected', 409)
+      }
 
-    // Recalculate total including both stages
-    const stage2Total = bill.lab_fee + bill.medication_fee + bill.procedure_fee
-    const totalAmount = bill.consultation_fee + stage2Total
+      const effectiveConsultation = bill.consultation_fee_status === 'waived' ? 0 : bill.consultation_fee
+      const billTotal = effectiveConsultation + bill.lab_fee + bill.medication_fee + bill.procedure_fee
 
-    await prisma.$transaction([
-      prisma.payment.create({
-        data: {
+      if (discount > billTotal - alreadyPaid) {
+        throw httpError(`Discount (${discount}) cannot exceed the outstanding balance (${billTotal - alreadyPaid})`)
+      }
+
+      const required = billTotal - discount - alreadyPaid
+      if (paymentsSum !== required) {
+        throw httpError(
+          `Payments (${paymentsSum}) must settle the outstanding balance exactly: ` +
+          `total ${billTotal} − discount ${discount} − already paid ${alreadyPaid} = ${required}`
+        )
+      }
+
+      await tx.payment.createMany({
+        data: lines.map((p) => ({
           bill_id: bill.id,
           cashier_id: cashierId,
-          amount: Number(amount),
-          method,
-          reference: reference || null,
+          amount: p.amount,
+          method: p.method,
+          reference: p.reference,
           stage: 2,
           paid_at: now,
-        },
-      }),
+        })),
+      })
 
-      prisma.bill.update({
+      await tx.bill.update({
         where: { id: bill.id },
         data: {
           stage2_status: 'paid',
           stage2_paid_at: now,
-          total_amount: totalAmount,
+          total_amount: billTotal,
+          discount_amount: discount,
+          discount_reason: discountReason,
           fee_status: 'paid',
         },
-      }),
+      })
 
-      prisma.visit.update({
+      await tx.visit.update({
         where: { id: Number(visit_id) },
         data: { status: 'done' },
-      }),
-    ])
+      })
 
-    // Post-commit side effects — payment is durable; nothing here may fail
-    // the request. FIXED: previous version had a bare `unknown` identifier
-    // (ReferenceError) that crashed AFTER the money committed, reporting a
-    // false 500 for a successful payment.
+      return { stage: 2, visit, next_status: 'done', billTotal, discount }
+    })
+
+    // ── Post-commit side effects — payment is durable; nothing here may fail
+    //    the request ─────────────────────────────────────────────────────────
+    const patientName = result.visit?.patient?.name ?? 'Unknown'
+    const methodSummary = lines.map((p) => `${p.method} ${p.amount}`).join(' + ')
+
     try {
       await writeAuditLog({
         staffId: currentUser.id,
         user: currentUser.username,
-        action: 'Stage 2 Payment',
-        description: `Stage 2 payment of ${amount} (${method}) recorded for ${visit.patient.name} — visit #${visit_id}`,
+        action: result.stage === 1 ? 'Stage 1 Payment' : 'Stage 2 Payment',
+        description:
+          `Stage ${result.stage} payment of ${paymentsSum} (${methodSummary})` +
+          (result.stage === 2 && result.discount > 0 ? ` with discount ${result.discount} (${discountReason})` : '') +
+          ` recorded for ${patientName} — visit #${visit_id}`,
         category: 'payment',
         ipAddress: ip,
       })
 
-      if (visit.visit_type === 'direct_lab') {
+      if (result.stage === 1) {
         await createNotification({
-          targetRoles: ['admin'],
-          type: NOTIFICATION_TYPES.REFERRED_PATIENT_PAID,
-          title: 'Pending commission payment',
-          visitId: visit.id,
-          message: `${visit?.patient?.name || 'Unknown'} referred by ${visit?.referred_by || 'unknown'} has paid`,
+          targetRoles: ['doctor'],
+          type: NOTIFICATION_TYPES.VISIT_FORWARDED,
+          visitId: Number(visit_id),
+          title: 'Patient ready for consultation',
+          message: `${patientName} has paid and is waiting for consultation.`,
           io,
         })
-        io.to('admin').emit('payment:referred_patient_paid')
+        io.to('doctor').emit('visit:new', { visit_id: Number(visit_id), patient_name: patientName })
+      }
+
+      if (result.stage === 2 && result.visit.visit_type === 'direct_lab') {
+        // create a referral
+        if (result?.visit?.referred_by?.trim() !== '') {
+          await prisma.Referral.create({
+            data: {
+              visit_id: Number(visit_id),
+              referrer_name: result?.visit?.referred_by.trim(),
+              referrer_phone: result?.visit?.referrer_phone ?? null,
+            }
+          })
+          await createNotification({
+            targetRoles: ['admin'],
+            type: NOTIFICATION_TYPES.REFERRED_PATIENT_PAID,
+            title: 'Pending commission payment',
+            visitId: result.visit.id,
+            message: `${patientName} referred by ${result.visit?.referred_by || 'unknown'} has paid`,
+            io,
+          })
+        }
+        io.to('admin').emit('referral:new')
       }
     } catch (sideErr) {
       console.error('collectPayment post-commit side effect failed:', sideErr)
@@ -846,13 +871,114 @@ module.exports.collectPayment = async (req, res) => {
 
     return res.json({
       success: true,
-      next_status: 'done',
-      message: 'Stage 2 payment collected — visit complete',
+      next_status: result.next_status,
+      message: result.stage === 1
+        ? 'Stage 1 payment collected — patient ready for doctor'
+        : 'Stage 2 payment collected — visit complete',
     })
 
-  } catch (err) {
-    console.error('collectPayment error:', err.message)
+  } catch (error) {
+    if (error.status) {
+      return res.status(error.status).json({ error: error.message })
+    }
+    console.error('collectPayment error:', error)
     return res.status(500).json({ error: 'Failed to collect payment' })
+  }
+}
+
+module.exports.waiveStage1 = async (req, res) => {
+  const { id } = req.params
+  const { reason } = req.body
+  const currentUser = req.user
+  const ip = req.ip ?? null
+  const io = getIO()
+
+  if (!reason || !String(reason).trim()) {
+    return res.status(400).json({ error: 'A reason is required to waive the consultation fee' })
+  }
+
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      const visit = await tx.visit.findUnique({
+        where: { id: Number(id) },
+        include: { bill: true, patient: { select: { name: true } } },
+      })
+
+      if (!visit) throw Object.assign(new Error('Visit not found'), { status: 404 })
+      if (!visit.bill) throw Object.assign(new Error('No bill found'), { status: 404 })
+      if (visit.visit_type !== 'consultation') {
+        throw Object.assign(new Error('Only consultation visits can have stage 1 waived'), { status: 400 })
+      }
+      if (visit.status !== 'waiting') {
+        throw Object.assign(new Error(`Cannot waive — visit is already ${visit.status}`), { status: 400 })
+      }
+      if (visit.bill.consultation_fee_status === 'paid') {
+        throw Object.assign(new Error('Stage 1 is already paid — use refund instead'), { status: 409 })
+      }
+      if (visit.bill.consultation_fee_status === 'waived') {
+        throw Object.assign(new Error('Stage 1 is already waived'), { status: 409 })
+      }
+
+      await tx.bill.update({
+        where: { id: visit.bill.id },
+        data: {
+          consultation_fee_status: 'waived',
+          consultation_fee_waived_by: currentUser?.username ?? 'unknown',
+          consultation_fee_waive_reason: String(reason).trim(),
+          consultation_fee_waived_at: new Date(),
+        },
+      })
+
+      await tx.visit.update({
+        where: { id: Number(id) },
+        data: { status: 'consultation_paid' },
+      })
+
+      return visit
+    })
+
+    const patientName = result.patient?.name ?? 'Unknown'
+
+    try {
+      await writeAuditLog({
+        staffId: currentUser?.id,
+        user: currentUser?.username,
+        action: 'Waive Stage 1',
+        description: `Waived consultation fee for ${patientName} — reason: ${String(reason).trim()}`,
+        category: 'payment',
+        entity: 'bill',
+        entityId: result.bill.id,
+        ipAddress: ip,
+      })
+
+      await createNotification({
+        targetRoles: ['doctor'],
+        type: NOTIFICATION_TYPES.VISIT_FORWARDED,
+        visitId: Number(id),
+        title: 'Patient ready for consultation',
+        message: `${patientName} (consultation fee waived) is waiting for consultation.`,
+        io,
+      })
+
+      io.to('doctor').emit('visit:new', {
+        visit_id: Number(id),
+        patient_name: patientName,
+      })
+    } catch (sideErr) {
+      console.error('waiveStage1 post-commit side effect failed:', sideErr)
+    }
+
+    return res.json({
+      success: true,
+      message: 'Consultation fee waived — patient forwarded to doctor',
+    })
+
+  } catch (error) {
+    if (error.status) {
+      return res.status(error.status).json({ error: error.message })
+    }
+    console.error('waiveStage1 error:', error)
+    return res.status(500).json({ error: 'Failed to waive consultation fee' })
   }
 }
 

@@ -114,52 +114,23 @@ function requireFields(body, fields) {
   return missing.length ? missing : null
 }
 
-/**
- * Parse and validate a positive integer from a string.
- * Returns the number, or null if invalid.
- *
- * @param {any} val
- * @returns {number|null}
- */
 function parsePositiveInt(val) {
   const n = parseInt(val)
   return (!isNaN(n) && n > 0) ? n : null
 }
 
-/**
- * Parse and validate a non-negative number (amount, quantity etc).
- * Returns the number, or null if invalid.
- *
- * @param {any} val
- * @returns {number|null}
- */
+
 function parseAmount(val) {
   const n = parseFloat(val)
   return (!isNaN(n) && n >= 0) ? Math.round(n) : null
 }
 
-/**
- * Safely parse a date string. Returns a Date object or null.
- *
- * @param {any} val
- * @returns {Date|null}
- */
 function parseDate(val) {
   if (!val) return null
   const d = new Date(val)
   return isNaN(d.getTime()) ? null : d
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// AUDIT LOG
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Write an audit log entry. Never throws — errors are swallowed so a
- * logging failure never crashes a request.
- *
- * @param {{ staffId?, user?, action, description, category, entity?, entityId?, ipAddress? }} params
- */
 async function writeAuditLog({ staffId, user, action, description, category, entity, entityId, ipAddress }) {
   try {
     await prisma.auditLog.create({
@@ -180,26 +151,7 @@ async function writeAuditLog({ staffId, user, action, description, category, ent
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// NOTIFICATIONS
-// ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Create a DB notification. Never throws.
- * Optionally pass `io` to also push via WebSocket immediately.
- *
- * Usage:
- *   await createNotification({
- *     role:     'doctor',
- *     type:     'info',
- *     message:  'New patient ready for consultation',
- *     entity:   'visit',
- *     entityId: visit.id,
- *     io,       // optional — pass your socket.io instance for real-time push
- *   })
- *
- * @param {{ staffId?, role?, type, message, entity?, entityId?, io? }} params
- */
 async function createNotification({ targetRoles, targetStaffId, type, title, message, visitId, io }) {
   let notification = null
 
@@ -248,18 +200,6 @@ async function createNotification({ targetRoles, targetStaffId, type, title, mes
   return notification
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// QUEUE NUMBER
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Generate the next queue number for today.
- * Finds the highest queue_number among today's visits and increments by 1.
- * Call this inside a transaction when registering a new visit.
- *
- * @param {object} tx  — Prisma transaction client (or prisma directly)
- * @returns {Promise<number>}
- */
 async function getNextQueueNumber(tx = prisma) {
   const today = new Date()
   today.setHours(0, 0, 0, 0)
@@ -290,6 +230,9 @@ const NOTIFICATION_TYPES = {
   RESTOCK_REQUESTED: 'restock:requested',
   RESTOCK_APPROVED: 'restock:approved',
   RESTOCK_REJECTED: 'restock:rejected',
+  ORDER_NEW: 'order_new',
+  ORDER_FULFILLED: 'order_fulfilled',
+  ORDER_CANCELLED: 'order_cancelled',
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -332,6 +275,110 @@ function serverError(res, context, err) {
   return res.status(500).json({ error: 'Something went wrong. Please try again.' })
 }
 
+
+
+// REPORTS HELPERS 
+
+function resolveRange(query) {
+  const { range = '7d', start, end } = query
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+ 
+  let rangeStart
+  let rangeEnd = new Date(today)
+  rangeEnd.setHours(23, 59, 59, 999)
+ 
+  switch (range) {
+    case 'today': {
+      rangeStart = new Date(today)
+      break
+    }
+    case '7d': {
+      rangeStart = new Date(today)
+      rangeStart.setDate(rangeStart.getDate() - 6)
+      break
+    }
+    case '30d': {
+      rangeStart = new Date(today)
+      rangeStart.setDate(rangeStart.getDate() - 29)
+      break
+    }
+    case 'month': {
+      rangeStart = new Date(today.getFullYear(), today.getMonth(), 1)
+      break
+    }
+    case 'custom': {
+      rangeStart = new Date(start)
+      rangeEnd = new Date(end)
+      rangeEnd.setHours(23, 59, 59, 999)
+      if (isNaN(rangeStart.getTime()) || isNaN(rangeEnd.getTime())) {
+        throw new Error('Invalid custom date range')
+      }
+      break
+    }
+    default: {
+      rangeStart = new Date(today)
+      rangeStart.setDate(rangeStart.getDate() - 6)
+    }
+  }
+ 
+  const days = Math.max(
+    1,
+    Math.round((rangeEnd - rangeStart) / (1000 * 60 * 60 * 24)) + 1
+  )
+ 
+  return { start: rangeStart, end: rangeEnd, days }
+}
+ 
+// Builds one bucket per day in the range, keyed by date string for O(1)
+// lookups when tallying rows. Label switches from weekday ('Mon') to
+// 'Mon D' once the range exceeds 7 days, so labels don't repeat/collide
+// on 30-day or month views.
+function buildDayBuckets(start, days) {
+  const buckets = []
+  for (let i = 0; i < days; i++) {
+    const d = new Date(start)
+    d.setDate(start.getDate() + i)
+    buckets.push({
+      key: d.toDateString(),
+      day:
+        days <= 7
+          ? d.toLocaleDateString('en-US', { weekday: 'short' })
+          : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+      count: 0,
+    })
+  }
+  return buckets
+}
+
+function parseDateRange(from, to) {
+  const fromDate = new Date(`${from}T00:00:00.000Z`)
+  const toDate = new Date(`${to}T23:59:59.999Z`)
+  return { fromDate, toDate }
+}
+
+function getPagination(req) {
+  const page = Math.max(1, parseInt(req.query.page) || 1)
+  const limit = Math.max(1, Math.min(100, parseInt(req.query.limit) || 10))
+  const offset = (page - 1) * limit
+  return { page, limit, offset }
+}
+
+function validatePaymentLines(payments, total) {
+  if (!Array.isArray(payments) || payments.length === 0) {
+    throw Object.assign(new Error('At least one payment line required'), { status: 400 })
+  }
+  const sum = payments.reduce((s, p) => s + (parseInt(p.amount) || 0), 0)
+  if (sum !== total) {
+    throw Object.assign(
+      new Error(`Payment total (${sum}) does not match sale total (${total})`),
+      { status: 400 }
+    )
+  }
+  const hasCredit = payments.some(p => p.method === 'credit')
+  return { hasCredit }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // EXPORTS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -364,4 +411,9 @@ module.exports = {
   missingFieldsError,
   notFoundError,
   serverError,
+  resolveRange,
+  buildDayBuckets,
+  parseDateRange,
+  getPagination,
+  validatePaymentLines,
 }

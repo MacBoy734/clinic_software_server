@@ -16,6 +16,8 @@ router.get('/requests', c.getRequests)
 router.get('/requests/:id', c.getRequestById)
 router.get('/stock', c.getStock)
 router.get('/orders', c.getLabOrders)
+router.get('/supplies', c.getSupplies)
+router.post('/orders', c.createPharmacyOrder)
 router.patch('/requests/:id/status', c.updateRequestStatus)
 
 module.exports = router
