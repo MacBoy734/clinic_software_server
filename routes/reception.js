@@ -1,22 +1,47 @@
 const router = require('express').Router()
 const c = require('../controllers/reception_controller')
 const { authenticate, authorize } = require('../middleware/auth')
+const validate = require('../middleware/validate')
+const schemas = require('../utils/schemaValidations')
 
+// ─── GET routes (light query validation) ─────────────────────────────────────
 router.get('/queue', authenticate, authorize('receptionist'), c.getQueue)
-router.get('/visits', authenticate, authorize('receptionist'), c.getVisits)
 router.get('/bills', authenticate, authorize('receptionist'), c.getBills)
 router.get('/stats', authenticate, authorize('receptionist'), c.getStats)
-router.get('/patients/search', authenticate, authorize('receptionist'), c.searchPatients)
-router.get('/charge-templates', authenticate, authorize('receptionist'), c.getChargeTemplates)
-router.post('/register', authenticate, authorize('receptionist'), c.registerVisit)
 
-router.patch('/visits/:id/forward-to-doctor', authenticate, authorize('receptionist'), c.forwardToDoctor)
-router.patch('/visits/:id/forward-to-lab', authenticate, authorize('receptionist'), c.forwardToLab)
-router.patch('/visits/:id/forward-to-billing', authenticate, authorize('receptionist'), c.forwardToBilling)
-router.patch('/visits/:id/mark-done', authenticate, authorize('receptionist'), c.markDone)
-router.patch('/visits/:id/archive', authenticate, authorize('receptionist'), c.archiveVisit)
-router.patch('/visits/:id/stage1-payment', authenticate, authorize('receptionist'), c.stage1Payment)
-router.patch('/visits/:id/waive-stage1', c.waiveStage1)
-router.patch('/payments', authenticate, authorize('receptionist'), c.collectPayment)
+router.get('/patients/search', 
+  authenticate, 
+  authorize('receptionist'), 
+  validate({ query: schemas.patientSearchSchema }),   // ← q trimmed, min 2 chars
+  c.searchPatients
+)
+
+router.get('/charge-templates', authenticate, authorize('receptionist'), c.getChargeTemplates)
+
+// ─── POST register (THE BIG ONE — phone sanitization lives here) ─────────────
+router.post('/register', 
+  authenticate, 
+  authorize('receptionist'), 
+  validate({ body: schemas.registerVisitSchema }),    // ← name trimmed, phone regex'd, age coerced, etc.
+  c.registerVisit
+)
+
+// ─── PATCH status transitions (prevents NaN / abc IDs) ───────────────────────
+router.patch('/visits/:id/forward-to-doctor', authenticate, authorize('receptionist'), validate({ params: schemas.idParamSchema }), c.forwardToDoctor)
+router.patch('/visits/:id/forward-to-lab',    authenticate, authorize('receptionist'), validate({ params: schemas.idParamSchema }), c.forwardToLab)
+router.patch('/visits/:id/forward-to-billing',authenticate, authorize('receptionist'), validate({ params: schemas.idParamSchema }), c.forwardToBilling)
+router.patch('/visits/:id/mark-done',         authenticate, authorize('receptionist'), validate({ params: schemas.idParamSchema }), c.markDone)
+router.patch('/visits/:id/archive',           authenticate, authorize('receptionist'), validate({ params: schemas.idParamSchema }), c.archiveVisit)
+
+
+router.patch('/visits/:id/waive',
+  authenticate,
+  authorize('receptionist'),
+  validate({ params: schemas.idParamSchema, body: schemas.waivePaymentSchema }),
+  c.waivePayment
+)
+
+// NOTE: collectPayment is next — leave it alone for now
+router.patch('/payments', authenticate, authorize('receptionist'),  validate({ body: schemas.collectPaymentSchema }), c.collectPayment)
 
 module.exports = router

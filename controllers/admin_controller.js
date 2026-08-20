@@ -2545,19 +2545,14 @@ module.exports.verifyRestock = async (req, res) => {
         if (!r.product_id)
           throw Object.assign(new Error('Restock request has no linked product'), { http: 422 })
 
+        // ── LOCK: prevents race with takeStock/giveStock on this product ──
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${r.product_id})`
+
         const product = await tx.product.findUnique({
           where: { id: r.product_id },
-          include: { batches: true },
         })
         if (!product)
           throw Object.assign(new Error('Product no longer exists in the catalog'), { http: 404 })
-
-        let maxBatchNum = 0
-        for (const b of product.batches) {
-          const num = parseInt(b.batch_number, 10)
-          if (!isNaN(num) && num > maxBatchNum) maxBatchNum = num
-        }
-        const nextBatchNum = String(maxBatchNum + 1)
 
         const finalExpiry = expiry_date ? new Date(expiry_date) : r.expiry_date
         const finalUnitCost = r.unit_cost ?? product.unit_cost
@@ -2567,10 +2562,10 @@ module.exports.verifyRestock = async (req, res) => {
           data: { current_stock: { increment: qty } },
         })
 
+        // batch_number is autoincrement — Prisma handles it
         await tx.productBatch.create({
           data: {
             product_id: product.id,
-            batch_number: nextBatchNum,
             expiry_date: finalExpiry,
             quantity: qty,
             unit_cost: finalUnitCost,
@@ -2609,7 +2604,7 @@ module.exports.verifyRestock = async (req, res) => {
         where: { id },
         data: {
           status: 'approved',
-          received_qty: qty,
+          quantity: qty,
           verified_by: currentUser.username,
           verification_notes: verification_notes ?? null,
           verified_at: new Date(),
@@ -2675,7 +2670,7 @@ module.exports.rejectRestock = async (req, res) => {
 
 module.exports.getReferrals = async (req, res) => {
   try {
-    const rows = await prisma.Referral.findMany({
+    const rows = await prisma.referral.findMany({
       include: {
         visit: {
           include: {
@@ -2772,14 +2767,14 @@ module.exports.createReferral = async (req, res) => {
     }
 
     // Check no referral already exists for this visit
-    const existing = await prisma.Referral.findUnique({
+    const existing = await prisma.referral.findUnique({
       where: { visit_id: Number(visit_id) },
     })
     if (existing) {
       return res.status(409).json({ error: 'A referral already exists for this visit' })
     }
 
-    const referral = await prisma.Referral.create({
+    const referral = await prisma.referral.create({
       data: {
         visit_id: Number(visit_id),
         referrer_name: referrer_name.trim(),
@@ -2821,7 +2816,7 @@ module.exports.payReferral = async (req, res) => {
   }
 
   try {
-    const referral = await prisma.Referral.findUnique({
+    const referral = await prisma.referral.findUnique({
       where: { id: referralId },
     })
 
@@ -2832,7 +2827,7 @@ module.exports.payReferral = async (req, res) => {
       return res.status(409).json({ error: 'This referral has already been marked as paid' })
     }
 
-    const updated = await prisma.Referral.update({
+    const updated = await prisma.referral.update({
       where: { id: referralId },
       data: {
         status: 'paid',

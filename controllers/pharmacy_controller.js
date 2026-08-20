@@ -3,7 +3,7 @@
 const prisma = require('../lib/prisma')
 
 const { getIO } = require('../utils/socket')
-const { createNotification, writeAuditLog, NOTIFICATION_TYPES, validatePaymentLines } = require('../utils/helpers')
+const { createNotification, writeAuditLog, NOTIFICATION_TYPES, validatePaymentLines, recomputeMedicationFee } = require('../utils/helpers')
 
 
 const CATEGORIES = ['medication', 'consumable', 'general']
@@ -64,28 +64,56 @@ class ShortfallError extends Error {
 
 
 async function takeStock(tx, { productId, quantity, reason, refType, refId, staffId, note }) {
-  if (!productId || quantity <= 0) return null
+  if (!productId || !quantity || quantity <= 0) return null
 
-  // Fetch active batches ordered by expiry_date ASC (FEFO), then received_at ASC
+  // Serialize all stock operations on this product
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${productId})`
+
+  // Read current state first
+  const product = await tx.product.findUnique({
+    where: { id: productId },
+    select: { current_stock: true, name: true },
+  })
+  if (!product) throw new Error(`Product ${productId} not found`)
+  if (product.current_stock < quantity) return null
+
+  // Find available batches — FEFO: oldest expiry first, then oldest received
   const batches = await tx.productBatch.findMany({
-    where: { product_id: productId, is_exhausted: false },
+    where: {
+      product_id: productId,
+      is_exhausted: false,
+      quantity: { gt: 0 },
+    },
     orderBy: [{ expiry_date: 'asc' }, { received_at: 'asc' }],
   })
 
-  // Legacy fallback: product has stock but no batch records yet.
-  // Just decrement the product and log — no batch to touch.
+  const batchTotal = batches.reduce((sum, b) => sum + b.quantity, 0)
+
+  // If batches exist but don't cover the quantity, data is inconsistent
+  if (batches.length > 0 && batchTotal < quantity) {
+    throw new Error(
+      `Stock inconsistency for ${product.name}: product stock=${product.current_stock}, ` +
+      `batch total=${batchTotal}, requested=${quantity}`
+    )
+  }
+
+  // Atomically decrement product stock
+  const guard = await tx.product.updateMany({
+    where: { id: productId, current_stock: { gte: quantity } },
+    data: { current_stock: { decrement: quantity } },
+  })
+  if (guard.count === 0) return null
+
+  const updatedProduct = await tx.product.findUnique({
+    where: { id: productId },
+    select: { current_stock: true },
+  })
+
+  const batches_used = []
+  let remaining = quantity
+
+  // Legacy fallback: no batch records yet
   if (batches.length === 0) {
-    const guard = await tx.product.updateMany({
-      where: { id: productId, current_stock: { gte: quantity } },
-      data: { current_stock: { decrement: quantity } },
-    })
-    if (guard.count === 0) return null
-
-    const row = await tx.product.findUnique({
-      where: { id: productId },
-      select: { current_stock: true },
-    })
-
     await tx.stockMovement.create({
       data: {
         product_id: productId,
@@ -93,98 +121,175 @@ async function takeStock(tx, { productId, quantity, reason, refType, refId, staf
         reason,
         ref_type: refType ?? null,
         ref_id: refId ?? null,
-        balance_after: row.current_stock,
-        note: note ?? null,
+        balance_after: updatedProduct.current_stock,
+        note: note ?? 'Deduction without batch tracking (legacy stock)',
         staff_id: staffId ?? null,
       },
     })
-    return row.current_stock
+    return {
+      balance_after: updatedProduct.current_stock,
+      batches_used: [],
+    }
   }
 
-  // Check batch total matches reality before we commit anything
-  const totalAvailable = batches.reduce((sum, b) => sum + b.quantity, 0)
-  if (totalAvailable < quantity) return null
-
-  // Atomic guard on the product row
-  const guard = await tx.product.updateMany({
-    where: { id: productId, current_stock: { gte: quantity } },
-    data: { current_stock: { decrement: quantity } },
-  })
-  if (guard.count === 0) return null
-
-  // Walk batches oldest-first, deleting each one as it is exhausted
-  let remaining = quantity
+  // Walk batches oldest-first (FEFO).
+  // If oldest doesn't have enough, exhaust it and move to the next oldest.
   for (const batch of batches) {
     if (remaining <= 0) break
 
     const deduct = Math.min(batch.quantity, remaining)
     const newQty = batch.quantity - deduct
 
-    if (newQty === 0) {
-      await tx.productBatch.update({
-        where: { id: batch.id },
-        data: { quantity: 0, is_exhausted: true },
-      })
-    } else {
-      await tx.productBatch.update({
-        where: { id: batch.id },
-        data: { quantity: newQty },
-      })
-    }
+    await tx.productBatch.update({
+      where: { id: batch.id },
+      data: {
+        quantity: newQty,
+        is_exhausted: newQty === 0,
+      },
+    })
+
+    await tx.stockMovement.create({
+      data: {
+        product_id: productId,
+        batch_id: batch.id,
+        delta: -deduct,
+        reason,
+        ref_type: refType ?? null,
+        ref_id: refId ?? null,
+        balance_after: updatedProduct.current_stock,
+        note: note
+          ? `${note} (batch #${batch.batch_number})`
+          : `Deducted from batch #${batch.batch_number}`,
+        staff_id: staffId ?? null,
+      },
+    })
+
+    batches_used.push({
+      batch_id: batch.id,
+      batch_number: batch.batch_number,
+      quantity_deducted: deduct,
+    })
 
     remaining -= deduct
   }
 
-  const row = await tx.product.findUnique({
-    where: { id: productId },
-    select: { current_stock: true },
-  })
+  // Bulletproof: if batches ran dry despite our check, explode loudly
+  if (remaining > 0) {
+    throw new Error(
+      `Batch deduction failed for ${product.name}: ` +
+      `${remaining} units remaining after exhausting all batches`
+    )
+  }
 
-  await tx.stockMovement.create({
-    data: {
-      product_id: productId,
-      delta: -quantity,
-      reason,
-      ref_type: refType ?? null,
-      ref_id: refId ?? null,
-      balance_after: row.current_stock,
-      note: note ?? null,
-      staff_id: staffId ?? null,
-    },
-  })
-
-  return row.current_stock
+  return {
+    balance_after: updatedProduct.current_stock,
+    batches_used,
+  }
 }
 
-async function giveStock(tx, { productId, quantity, reason, refType, refId, staffId, note }) {
-  if (!productId || quantity <= 0) return null
+async function giveStock(tx, { productId, quantity, batch_id, reason, refType, refId, staffId, note }) {
+  if (!productId || !quantity || quantity <= 0) return null
 
-  const row = await tx.product.update({
+  // Serialize all stock operations on this product
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${productId})`
+
+  const product = await tx.product.findUnique({
+    where: { id: productId },
+    select: { current_stock: true, name: true },
+  })
+  if (!product) throw new Error(`Product ${productId} not found`)
+
+  const updatedProduct = await tx.product.update({
     where: { id: productId },
     data: { current_stock: { increment: quantity } },
     select: { current_stock: true },
   })
 
+  let targetBatch = null
+  let alreadyIncremented = false
+
+  // ── Try exact batch first (returns) ──
+  if (batch_id) {
+    const exactBatch = await tx.productBatch.findUnique({
+      where: { id: batch_id },
+    })
+
+    if (exactBatch && exactBatch.product_id === productId) {
+      targetBatch = await tx.productBatch.update({
+        where: { id: batch_id },
+        data: {
+          quantity: { increment: quantity },
+          is_exhausted: false,
+        },
+      })
+      alreadyIncremented = true
+    }
+    // If not found or belongs to wrong product: silently fall through
+  }
+
+  // ── Fallback: oldest non-exhausted batch (FEFO) ──
+  if (!targetBatch) {
+    targetBatch = await tx.productBatch.findFirst({
+      where: {
+        product_id: productId,
+        is_exhausted: false,
+        quantity: { gte: 0 },
+      },
+      orderBy: [{ expiry_date: 'asc' }, { received_at: 'asc' }],
+    })
+  }
+
+  // ── Increment the fallback batch if we haven't already ──
+  if (targetBatch && !alreadyIncremented) {
+    targetBatch = await tx.productBatch.update({
+      where: { id: targetBatch.id },
+      data: {
+        quantity: { increment: quantity },
+        is_exhausted: false,
+      },
+    })
+    alreadyIncremented = true
+  }
+
+  // ── Last resort: create adjustment batch ──
+  if (!targetBatch) {
+    targetBatch = await tx.productBatch.create({
+      data: {
+        product_id: productId,
+        quantity: quantity,
+        received_at: new Date(),
+        notes: note || 'Stock adjustment / return fallback',
+      },
+    })
+  }
+
   await tx.stockMovement.create({
     data: {
       product_id: productId,
+      batch_id: targetBatch.id,
       delta: quantity,
       reason,
       ref_type: refType ?? null,
       ref_id: refId ?? null,
-      balance_after: row.current_stock,
-      note: note ?? null,
+      balance_after: updatedProduct.current_stock,
+      note: note
+        ? `${note} (batch #${targetBatch.batch_number})`
+        : `Credited to batch #${targetBatch.batch_number}`,
       staff_id: staffId ?? null,
     },
   })
-  return row.current_stock
+
+  return {
+    balance_after: updatedProduct.current_stock,
+    batch_credited: {
+      batch_id: targetBatch.id,
+      batch_number: targetBatch.batch_number,
+    },
+  }
 }
 
-exports._takeStock = takeStock
-exports._giveStock = giveStock
-exports._ShortfallError = ShortfallError
 
-function shapeProduct(p, markupPct) {
+function shapeProduct(p) {
   return {
     id: p.id,
     sku: p.sku ?? null,
@@ -206,11 +311,6 @@ function shapeProduct(p, markupPct) {
     pharmacy_normal_price: p.normal_price, // legacy alias
     promotional_price: p.promotional_price,
     wholesale_price: p.wholesale_price,
-
-    // What the doctor's prescription modal would charge. Informational here.
-    clinic_price:
-      markupPct == null ? null : Math.round(p.normal_price * (1 + markupPct / 100)),
-
     supplier: p.supplier ?? null,
     stock_value: p.current_stock * p.normal_price,
     updated_at: p.updated_at,
@@ -236,7 +336,7 @@ function shapePrescription(p) {
       id: it.id,
       medication: it.drug_name,
       product_id: it.product_id ?? null,
-      drug_id: it.product_id ?? null, // legacy alias — drop once clients migrate
+      drug_id: it.product_id ?? null,
       form: it.form ?? null,
       dosage: it.dosage,
       frequency: it.frequency,
@@ -246,6 +346,10 @@ function shapePrescription(p) {
       status: it.status,
       decline_reason: it.decline_reason ?? null,
       dispensed_at: it.dispensed_at ?? null,
+      return_reason: it.return_reason ?? null,
+      returned_by: it.returned_by ?? null,
+      returned_at: it.returned_at ?? null,
+      product_batch_id: it.product_batch_id ?? null,
       available_stock: it.product?.current_stock ?? null,
     })),
   }
@@ -362,10 +466,6 @@ const ORDER_INCLUDE = {
   },
 }
 
-async function readMarkupPct() {
-  const settings = await prisma.clinicSettings.findFirst({ orderBy: { id: 'asc' } })
-  return settings?.prescription_markup_pct ?? 25
-}
 
 function categoryWhere({ category, categories, exclude }) {
   if (CATEGORIES.includes(category)) return category
@@ -412,20 +512,16 @@ exports.getProducts = async (req, res) => {
       ]
     }
 
-    const [items, markupPct] = await Promise.all([
-      prisma.product.findMany({
+    const items = await prisma.product.findMany({
         where,
         orderBy: [{ category: 'asc' }, { name: 'asc' }],
         take: 500,
-      }),
-      readMarkupPct(),
-    ])
+      })
 
-    const shaped = items.map((p) => shapeProduct(p, markupPct))
+    const shaped = items.map((p) => shapeProduct(p))
 
     res.json({
       items: shaped,
-      markup_pct: markupPct,
       categories: CATEGORIES,
       sub_categories: [...new Set(shaped.map((i) => i.sub_category).filter(Boolean))].sort(),
     })
@@ -475,15 +571,12 @@ exports.getStock = async (req, res) => {
     if (cat !== undefined) where.category = cat
     if (req.query.include_inactive !== '1') where.is_active = true
 
-    const [items, markupPct] = await Promise.all([
-      prisma.product.findMany({
+    const items = await prisma.product.findMany({
         where,
         orderBy: [{ category: 'asc' }, { sub_category: 'asc' }, { name: 'asc' }],
-      }),
-      readMarkupPct(),
-    ])
+      })
 
-    const shaped = items.map((p) => shapeProduct(p, markupPct))
+    const shaped = items.map((p) => shapeProduct(p))
 
     res.json({
       items: shaped,
@@ -621,11 +714,20 @@ exports.getQueue = async (req, res) => {
   try {
     const todayStart = new Date(new Date().setHours(0, 0, 0, 0))
 
-    const [pending, dispensedToday] = await Promise.all([
+    const [active, dispensedToday] = await Promise.all([
       prisma.prescription.findMany({
-        where: { status: 'pending' },
+        where: {
+          OR: [
+            { status: 'pending' },
+            { status: 'returned' },
+            {
+              status: 'issued',
+              items: { some: { status: 'returned' } },
+            },
+          ],
+        },
         include: PRESCRIPTION_INCLUDE,
-        orderBy: { created_at: 'asc' },
+        orderBy: { updated_at: 'desc' },
       }),
       prisma.prescription.count({
         where: {
@@ -636,11 +738,11 @@ exports.getQueue = async (req, res) => {
     ])
 
     res.json({
-      prescriptions: pending.map(shapePrescription),
+      prescriptions: active.map(shapePrescription),
       dispensed_today: dispensedToday,
     })
   } catch (err) {
-    console.error('getQueue', err)
+    console.error('getQueue', err.message)
     res.status(500).json({ error: 'Failed to fetch queue' })
   }
 }
@@ -655,6 +757,7 @@ exports.dispensePrescription = async (req, res) => {
   }
 
   try {
+    // ── Pre-flight read (outside tx — cheap validation) ────────────────────
     const prescription = await prisma.prescription.findUnique({
       where: { id },
       include: PRESCRIPTION_INCLUDE,
@@ -665,12 +768,30 @@ exports.dispensePrescription = async (req, res) => {
     }
 
     const linked = prescription.items.filter((it) => it.product_id != null)
+    const unlinked = prescription.items.filter((it) => it.product_id == null)
     const now = new Date()
 
-    const updated = await prisma.$transaction(async (tx) => {
-      const shortfalls = []
+    // ── Transaction with row locking ───────────────────────────────────────
+    const result = await prisma.$transaction(async (tx) => {
+      // Lock prescription + bill so no concurrent operation can mutate them
+      await tx.$queryRaw`SELECT id FROM prescriptions WHERE id = ${id} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM bills WHERE visit_id = ${prescription.visit_id} FOR UPDATE`
+
+      // Re-verify status inside the lock (paranoid)
+      const freshRx = await tx.prescription.findUnique({
+        where: { id },
+        select: { status: true },
+      })
+      if (freshRx?.status !== 'pending') {
+        throw Object.assign(new Error('Prescription was modified by another user'), { status: 409 })
+      }
+
+      const issuedItems = []
+      const declinedItems = []
+
+      // ── Linked items: attempt stock deduction ────────────────────────────
       for (const it of linked) {
-        const balance = await takeStock(tx, {
+        const stockResult = await takeStock(tx, {
           productId: it.product_id,
           quantity: it.quantity,
           reason: 'dispense',
@@ -679,83 +800,251 @@ exports.dispensePrescription = async (req, res) => {
           staffId: currentUser?.id,
           note: `Visit #${prescription.visit_id} — ${it.drug_name}`,
         })
-        if (balance === null) {
-          const row = await tx.product.findUnique({ where: { id: it.product_id } })
-          shortfalls.push({
+
+        if (stockResult === null) {
+          // Stock guard failed — determine WHY for the response
+          const row = await tx.product.findUnique({
+            where: { id: it.product_id },
+            select: { current_stock: true, name: true },
+          })
+          const available = row?.current_stock ?? 0
+
+          await tx.prescriptionItem.update({
+            where: { id: it.id },
+            data: {
+              status: 'declined',
+              decline_reason:
+                available === 0
+                  ? 'Out of stock'
+                  : `Insufficient stock (available: ${available}, requested: ${it.quantity})`,
+            },
+          })
+
+          declinedItems.push({
             item_id: it.id,
             medication: it.drug_name,
             requested: it.quantity,
-            available: row?.current_stock ?? 0,
+            available,
+            reason:
+              available === 0
+                ? 'Out of stock'
+                : `Insufficient stock (available: ${available})`,
           })
+        } else {
+          await tx.prescriptionItem.update({
+            where: { id: it.id },
+            data: {
+              status: 'issued',
+              dispensed_at: now,
+              product_batch_id: stockResult.batches_used?.[0]?.batch_id ?? null,
+            },
+          })
+          issuedItems.push(it)
         }
       }
-      if (shortfalls.length) throw new ShortfallError(shortfalls)
 
-      await tx.prescriptionItem.updateMany({
-        where: { prescription_id: id },
-        data: { status: 'issued', dispensed_at: now },
-      })
+      // ── Unlinked items: nothing to dispense ──────────────────────────────
+      for (const it of unlinked) {
+        await tx.prescriptionItem.update({
+          where: { id: it.id },
+          data: {
+            status: 'declined',
+            decline_reason: 'Not linked to inventory product',
+          },
+        })
+        declinedItems.push({
+          item_id: it.id,
+          medication: it.drug_name,
+          requested: it.quantity,
+          available: 0,
+          reason: 'Not in inventory',
+        })
+      }
+
+      // ── Prescription status ──────────────────────────────────────────────
+      // If we issued at least 1 item → 'issued'. If 0 issued → keep 'pending'
+      // so pharmacy can retry after restock without the doctor rewriting.
+      const prescriptionStatus = issuedItems.length > 0 ? 'issued' : 'pending'
 
       const p = await tx.prescription.update({
         where: { id },
         data: {
-          status: 'issued',
-          dispensed_at: now,
+          status: prescriptionStatus,
+          dispensed_at: issuedItems.length > 0 ? now : null,
           pharmacist_id: currentUser?.id ?? null,
         },
         include: PRESCRIPTION_INCLUDE,
       })
 
+      // ── Recompute bill (locked row) ──────────────────────────────────────
+      await recomputeMedicationFee(tx, prescription.visit_id)
+
+      // ── Visit routing ────────────────────────────────────────────────────
       await tx.visit.update({
         where: { id: prescription.visit_id },
-        data: { status: 'with_doctor', medication_verification: true },
+        data: {
+          status: 'with_doctor',
+          medication_verification: true,
+        },
       })
 
-      return p
-    })
+      return {
+        prescription: p,
+        issuedCount: issuedItems.length,
+        declinedCount: declinedItems.length,
+        declinedItems,
+      }
+    }, { timeout: 15000 }) // generous timeout for batch operations
 
+    // ── Side effects (outside transaction) ─────────────────────────────────
     try {
       await createNotification({
         targetRoles: ['doctor'],
         type: NOTIFICATION_TYPES.RX_DISPENSED,
-        title: 'Prescription dispensed',
+        title: result.declinedCount > 0 ? 'Prescription partially dispensed' : 'Prescription dispensed',
         visitId: prescription.visit_id,
-        message: `Prescription #${prescription.id} for ${prescription.visit?.patient?.name ?? 'patient'} has been dispensed — review the medications before ending the consultation.`,
+        message:
+          result.declinedCount > 0
+            ? `Prescription #${id} — ${result.issuedCount} issued, ${result.declinedCount} declined.`
+            : `Prescription #${id} fully dispensed.`,
         io: safeIO(),
       })
-    } catch (e) { console.error('createNotification failed:', e.message) }
+    } catch (e) {
+      console.error('createNotification failed:', e.message)
+    }
 
     try {
       await writeAuditLog({
         staffId: currentUser?.id,
         user: currentUser?.username,
         action: 'dispense_prescription',
-        description: `Dispensed prescription #${id} for visit #${prescription.visit_id}`,
+        description: `Dispensed #${id} — ${result.issuedCount} issued, ${result.declinedCount} declined`,
         category: 'prescription',
         entity: 'prescription',
         entityId: id,
         ipAddress: ip,
       })
-    } catch (e) { console.error('writeAuditLog failed:', e.message) }
+    } catch (e) {
+      console.error('writeAuditLog failed:', e.message)
+    }
 
-    emit('rx:dispensed', {
-      visitId: prescription.visit_id,
-      prescriptionId: id,
-      patientName: prescription.visit?.patient?.name,
-    }, 'doctor')
+    emit(
+      'rx:dispensed',
+      {
+        visitId: prescription.visit_id,
+        prescriptionId: id,
+        patientName: prescription.visit?.patient?.name,
+        issuedCount: result.issuedCount,
+        declinedCount: result.declinedCount,
+        declinedItems: result.declinedItems,
+      },
+      'doctor'
+    )
 
-    res.json({ success: true, prescription: shapePrescription(updated) })
+    return res.json({
+      success: true,
+      prescription: shapePrescription(result.prescription),
+      partial: result.declinedCount > 0,
+      issued_count: result.issuedCount,
+      declined_count: result.declinedCount,
+      declined_items: result.declinedItems,
+    })
   } catch (err) {
-    if (err instanceof ShortfallError) {
-      return res.status(409).json({
-        error: 'Insufficient stock for one or more items — restock or cancel the prescription',
-        shortfalls: err.shortfalls,
-      })
+    if (err.status === 409) {
+      return res.status(409).json({ error: err.message })
     }
     console.error('dispensePrescription', err.message)
-    res.status(500).json({ error: 'Failed to dispense prescription' })
+    return res.status(500).json({ error: 'Failed to dispense prescription' })
   }
 }
+
+exports.confirmRestock = async (req, res) => {
+  try {
+    const itemId = req.params.id
+    const currentUser = req.user
+ 
+    const result = await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM prescription_items WHERE id = ${itemId} FOR UPDATE`
+ 
+      const item = await tx.prescriptionItem.findUnique({
+        where: { id: itemId },
+        include: { prescription: { select: { visit_id: true } } },
+      })
+      if (!item) throw Object.assign(new Error('Item not found'), { status: 404 })
+      if (item.status !== 'returned') {
+        throw Object.assign(
+          new Error(`Only returned items can be restocked. ${item.drug_name} is "${item.status}".`),
+          { status: 409 }
+        )
+      }
+ 
+      let stockRestored = false
+      if (item.product_id) {
+        await giveStock(tx, {
+          productId: item.product_id,
+          batch_id: item.product_batch_id ?? null,
+          quantity: item.quantity,
+          reason: 'return_to_stock',
+          refType: 'prescription_item',
+          refId: item.id,
+          staffId: currentUser?.id,
+          note: `Returned from visit #${item.prescription.visit_id}`,
+        })
+        stockRestored = true
+      }
+ 
+      await tx.prescriptionItem.update({
+        where: { id: itemId },
+        data: {
+          status: 'restocked',
+          restocked_by: currentUser?.username ?? null,
+          restocked_at: new Date(),
+        },
+      })
+ 
+      // No fee recompute: the charge came off at return time, and `restocked`
+      // is not billable either.
+ 
+      return {
+        visitId: item.prescription.visit_id,
+        drugName: item.drug_name,
+        quantity: item.quantity,
+        stockRestored,
+      }
+    })
+ 
+    try {
+      const io = safeIO()
+      if (io) io.to('doctor').emit('prescription:restocked', { visit_id: result.visitId, item_id: itemId })
+      await writeAuditLog({
+        staffId: currentUser?.id,
+        user: currentUser?.username,
+        action: 'confirm_restock',
+        description: `${result.drugName} ×${result.quantity} ${result.stockRestored ? 'returned to stock' : 'marked restocked (no linked product)'} — visit #${result.visitId}`,
+        category: 'stock',
+        entity: 'prescription_item',
+        entityId: itemId,
+        ipAddress: req.ip ?? null,
+      })
+    } catch (sideErr) {
+      console.error('confirmRestock side effect failed:', sideErr.message)
+    }
+ 
+    res.json({
+      success: true,
+      stock_restored: result.stockRestored,
+      message: result.stockRestored
+        ? `${result.drugName} restocked (+${result.quantity})`
+        : `${result.drugName} marked restocked (no linked stock item)`,
+    })
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message })
+    console.error('confirmRestock', err.message)
+    res.status(500).json({ error: 'Failed to confirm restock' })
+  }
+}
+ 
+
 
 exports.cancelPrescription = async (req, res) => {
   const id = parseInt(req.params.id)
@@ -836,29 +1125,13 @@ exports.createOtcSale = async (req, res) => {
   const currentUser = req.user
   const { customer_name, customer_phone, payments, items, discount_amount, discount_reason } = req.body
 
-  if (!Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ error: 'At least one item is required' })
-  }
-
-  const norm = []
-  for (const i of items) {
-    const quantity = parseInt(i.quantity)
-    if (!Number.isInteger(quantity) || quantity <= 0) {
-      return res.status(400).json({ error: 'Each item needs a positive quantity' })
-    }
-    const rawId = i.product_id ?? i.drug_id
-    norm.push({
-      productId: rawId != null ? parseInt(rawId) : null,
-      name: typeof i.name === 'string' ? i.name.trim() : '',
-      quantity,
-      tier: PRICE_TIERS.includes(i.price_tier) ? i.price_tier : 'normal',
-      clientPrice: Math.max(0, parseInt(i.unit_price) || 0),
-    })
-  }
-
-  if (norm.some((n) => n.productId == null && !n.name)) {
-    return res.status(400).json({ error: 'Custom lines need a name' })
-  }
+  const norm = items.map((i) => ({
+    productId: i.product_id ?? null,
+    name: i.name?.trim() || '',
+    quantity: i.quantity,
+    tier: i.price_tier || 'normal',
+    clientPrice: i.unit_price || 0,
+  }))
 
   try {
     const sale = await prisma.$transaction(async (tx) => {
@@ -877,9 +1150,9 @@ exports.createOtcSale = async (req, res) => {
         )
       }
 
-      // ── Build line items and calculate subtotal ───────────────────────────
+      // ── Build line metadata and calculate subtotal ───────────────────────
       let subtotal = 0
-      const lineData = norm.map((n) => {
+      const lineMeta = norm.map((n) => {
         const product = n.productId != null ? byId.get(n.productId) : null
         let unit_price
         let unit_cost = 0
@@ -890,7 +1163,6 @@ exports.createOtcSale = async (req, res) => {
               : n.tier === 'wholesale' ? product.wholesale_price
                 : product.normal_price
           unit_price = tierPrice > 0 ? tierPrice : product.normal_price
-          // NOTE: add `unit_cost Int @default(0)` to Product model if you want true margin tracking
           unit_cost = 0
         } else {
           unit_price = n.clientPrice
@@ -900,17 +1172,18 @@ exports.createOtcSale = async (req, res) => {
         subtotal += gross
 
         return {
-          product_id: n.productId,
+          productId: n.productId,
           name: product ? product.name : n.name,
           quantity: n.quantity,
           unit_price,
           unit_cost,
           price_tier: n.tier,
+          batch_id: null, // ← will be filled after stock deduction
         }
       })
 
-      // ── Validate discount (now that subtotal exists) ─────────────────────
-      const disc = Math.max(0, parseInt(discount_amount) || 0)
+      // ── Validate discount ────────────────────────────────────────────────
+      const disc = discount_amount
       if (disc > subtotal) {
         throw Object.assign(new Error('Discount cannot exceed the sale total'), { status: 400 })
       }
@@ -920,7 +1193,7 @@ exports.createOtcSale = async (req, res) => {
 
       const total = subtotal - disc
 
-      // ── Validate payments against discounted total ───────────────────────
+      // ── Validate payments ────────────────────────────────────────────────
       const { hasCredit } = validatePaymentLines(payments, total)
 
       if (hasCredit && (!customer_phone?.trim() || customer_name === 'Walk-in Customer')) {
@@ -942,7 +1215,7 @@ exports.createOtcSale = async (req, res) => {
 
       const displayMethod = hasCredit ? 'credit' : (payments[0]?.method || 'cash')
 
-      // ── Create sale row ────────────────────────────────────────────────────
+      // ── Create sale row (no items yet) ───────────────────────────────────
       const created = await tx.otcSale.create({
         data: {
           receipt_number: `OTC-TMP-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
@@ -956,8 +1229,51 @@ exports.createOtcSale = async (req, res) => {
           discount_amount: disc,
           discount_reason: disc > 0 ? String(discount_reason).trim() : null,
           discount_by: disc > 0 ? currentUser?.username ?? null : null,
-          items: { create: lineData },
         },
+      })
+
+      // ── Deduct stock and attach batch info per line item ─────────────────
+      const shortfalls = []
+
+      for (let i = 0; i < lineMeta.length; i++) {
+        const meta = lineMeta[i]
+        if (meta.productId == null) continue
+
+        const result = await takeStock(tx, {
+          productId: meta.productId,
+          quantity: meta.quantity,
+          reason: 'sale',
+          refType: 'otc_sale',
+          refId: created.id,
+          staffId: currentUser?.id,
+        })
+
+        if (result === null) {
+          const row = byId.get(meta.productId)
+          shortfalls.push({
+            name: row?.name ?? meta.name,
+            requested: meta.quantity,
+            available: row?.current_stock ?? 0,
+          })
+        } else {
+          meta.batch_id = result.batches_used?.[0]?.batch_id ?? null
+        }
+      }
+
+      if (shortfalls.length) throw new ShortfallError(shortfalls)
+
+      // ── Create items with batch IDs ──────────────────────────────────────
+      await tx.otcSaleItem.createMany({
+        data: lineMeta.map((meta) => ({
+          sale_id: created.id,
+          product_id: meta.productId,
+          name: meta.name,
+          quantity: meta.quantity,
+          unit_price: meta.unit_price,
+          unit_cost: meta.unit_cost,
+          price_tier: meta.price_tier,
+          product_batch_id: meta.batch_id,
+        })),
       })
 
       // ── Create payment lines ─────────────────────────────────────────────
@@ -969,27 +1285,6 @@ exports.createOtcSale = async (req, res) => {
           reference: (typeof p.reference === 'string' && p.reference.trim()) || null,
         })),
       })
-
-      // ── Deduct stock ─────────────────────────────────────────────────────
-      for (const n of norm) {
-        if (n.productId == null) continue
-        const balance = await takeStock(tx, {
-          productId: n.productId,
-          quantity: n.quantity,
-          reason: 'sale',
-          refType: 'otc_sale',
-          refId: created.id,
-          staffId: currentUser?.id,
-        })
-        if (balance === null) {
-          const row = byId.get(n.productId)
-          throw new ShortfallError([{
-            name: row?.name ?? n.name,
-            requested: n.quantity,
-            available: row?.current_stock ?? 0,
-          }])
-        }
-      }
 
       // ── Finalize receipt number ──────────────────────────────────────────
       return tx.otcSale.update({
@@ -1110,6 +1405,9 @@ exports.createInternalOrder = async (req, res) => {
     lab_tech: 'lab',
   }
   const department = ROLE_TO_DEPT[currentUser?.role]
+  if (!department || !ORDER_DEPARTMENTS.includes(department)) {
+  return res.status(403).json({ error: 'Your role cannot create supply orders' })
+}
 
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'Add at least one item to the order' })

@@ -3,7 +3,6 @@ const { verifyToken } = require('../lib/jwt')
 // Verify JWT cookie on every protected request
 const authenticate = (req, res, next) => {
   const token = req.cookies.token
-
   if (!token) {
     return res.status(401).json({ error: 'Not logged in' })
   }

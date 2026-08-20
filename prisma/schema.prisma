@@ -80,7 +80,6 @@ enum RestockDepartment {
 
 enum PrescriptionStatus {
   pending
-  dispensed
   issued
   returned
   cancelled
@@ -139,8 +138,6 @@ enum MovementReason {
 enum OrderDepartment {
   doctor
   lab
-  reception
-  admin
 }
 
 // ─── Staff ────────────────────────────────────────────────────────────────────
@@ -193,6 +190,7 @@ model Patient {
   id          Int      @id @default(autoincrement())
   name        String
   age         Int
+  age_unit String @default("years")
   gender      Gender
   phone       String?
   national_id String?  @unique
@@ -229,11 +227,6 @@ model Visit {
   diagnosis_code String?
 
   notes String?
-
-  procedure_name    String?
-  procedure_type    String?
-  procedure_notes   String?
-  procedure_done_by String?
 
   referred_by    String?
   referrer_phone String?
@@ -428,12 +421,19 @@ model PrescriptionItem {
   form            String?
   return_reason   String?
   product_id Int?
+  product_batch_id Int?
+  returned_by    String?
+  returned_at   DateTime?
+  restocked_by   String?
+  restocked_at   DateTime?
+  restock_reject_reason String?
 
   status         PrescriptionItemStatus @default(pending)
   decline_reason String?
   dispensed_at   DateTime?
 
   product      Product?     @relation(fields: [product_id], references: [id], onDelete: SetNull)
+  product_batch    ProductBatch? @relation(fields: [product_batch_id], references: [id], onDelete: SetNull)
   prescription Prescription @relation(fields: [prescription_id], references: [id], onDelete: Cascade)
 
   @@index([prescription_id])
@@ -538,6 +538,9 @@ model ProductBatch {
   is_exhausted  Boolean   @default(false) 
 
   product Product @relation(fields: [product_id], references: [id], onDelete: Cascade)
+  prescription_items PrescriptionItem[]
+  movements StockMovement[]
+  otc_sale_items     OtcSaleItem[]
 
   @@unique([product_id, batch_number])
   @@index([product_id, expiry_date])   
@@ -548,6 +551,7 @@ model ProductBatch {
 model StockMovement {
   id            Int   @id @default(autoincrement())
   product_id    Int
+  batch_id      Int?
   delta         Int 
   reason        MovementReason
   ref_type      String? 
@@ -558,6 +562,7 @@ model StockMovement {
   created_at    DateTime       @default(now())
 
   product Product @relation(fields: [product_id], references: [id])
+  batch   ProductBatch? @relation(fields: [batch_id], references: [id], onDelete: SetNull)
   staff   Staff?  @relation(fields: [staff_id], references: [id], onDelete: SetNull)
 
   @@index([product_id, created_at])
@@ -599,12 +604,14 @@ model OtcSaleItem {
   product_id Int? 
   name       String
   quantity   Int    @default(1)
-  unit_price Int    @default(0) // tax-inclusive, what was charged
-  unit_cost  Int    @default(0) // NEW — snapshot, keeps margin reconstructable
-  tax_amount Int    @default(0) // NEW — tax contained in this line, in total
+  unit_price Int    @default(0) 
+  unit_cost  Int    @default(0)
+  tax_amount Int    @default(0) 
   price_tier String @default("normal")
+  product_batch_id Int?
 
   sale    OtcSale  @relation(fields: [sale_id], references: [id], onDelete: Cascade)
+  product_batch    ProductBatch? @relation(fields: [product_batch_id], references: [id], onDelete: SetNull)
   product Product? @relation(fields: [product_id], references: [id], onDelete: SetNull)
 
   @@index([sale_id])
@@ -728,6 +735,9 @@ model Bill {
   procedure_fee  Int       @default(0)
   stage2_status  FeeStatus @default(pending)
   stage2_paid_at DateTime?
+  stage2_waived_by    String?
+  stage2_waive_reason String?
+  stage2_waived_at    DateTime?
 
   discount_amount Int     @default(0)
   discount_reason String?

@@ -637,7 +637,7 @@ exports.createRestockRequest = async (req, res) => {
 
   const {
     product_id, drug_stock_id, quantity,
-    batch_number, expiry_date, notes,
+    expiry_date, notes,
   } = req.body
 
   const productId = parseInt(product_id ?? drug_stock_id)
@@ -649,10 +649,6 @@ exports.createRestockRequest = async (req, res) => {
   if (!Number.isInteger(qty) || qty <= 0) {
     return res.status(400).json({ error: 'received quantity must be a positive whole number' })
   }
-
-  const batch = typeof batch_number === 'string' && batch_number.trim()
-    ? batch_number.trim()
-    : null
 
   let expiry = null
   if (expiry_date) {
@@ -685,12 +681,11 @@ exports.createRestockRequest = async (req, res) => {
         product_id: null,
         lab_stock_id: productId,
         quantity: qty,
-        batch_number: batch,
         expiry_date: expiry,
         notes: (typeof notes === 'string' && notes.trim()) || null,
         status: 'pending',
         requested_by: currentUser?.username ?? 'unknown',
-        requested_by_id: currentUser?.id ?? null,   // ✅ fixed
+        requested_by_id: currentUser?.id ?? null,  
       },
       include: RESTOCK_INCLUDE,
     })

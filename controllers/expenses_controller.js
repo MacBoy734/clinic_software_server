@@ -2,15 +2,7 @@ const prisma = require('../lib/prisma')
 const { getPeriodRange } = require('../utils/helpers')
 
 // ─── Domain/role authorization ───────────────────────────────────────────────
-//
-// Each role is allowed to touch exactly one expense domain.
-// `domain` from the query/body is only ever used to CONFIRM the request
-// matches what the role is allowed to do — it is never trusted blindly.
-// This closes the gap where a receptionist could pass ?domain=pharmacy
-// and read/write pharmacy expenses they have no business touching.
 
-// receptionist/pharmacist are locked to exactly one domain each.
-// admin is handled separately below — it can access either domain, or both.
 const ROLE_TO_DOMAIN = {
   receptionist: 'clinic',
   pharmacist: 'pharmacy',
@@ -21,18 +13,10 @@ const MODELS = {
   pharmacy: prisma.pharmacyExpense,
 }
 
-// Returns one of:
-//   { domain: 'clinic'|'pharmacy', model }   — single-domain access (locked role, or admin with ?domain=)
-//   { combined: true, models: [...] }        — admin with no domain specified, spans both tables
-//   { mismatch: true, allowedDomain, requestedDomain } — locked role tried to access the other domain
-//   { invalidDomain: true, requestedDomain } — admin passed a domain that doesn't exist
-//   null                                     — role has no expense access at all (doctor, lab_tech)
 function resolveDomain(req) {
   const role = req.user.role
   const requestedDomain = req.query?.domain || req.body?.domain
 
-  // Admin — full oversight. Explicit domain narrows to one table;
-  // no domain means "give me both, combined".
   if (role === 'admin') {
     if (requestedDomain) {
       if (!MODELS[requestedDomain]) {
@@ -49,9 +33,8 @@ function resolveDomain(req) {
     }
   }
 
-  // Locked roles — receptionist/pharmacist only ever see their own domain.
   const allowedDomain = ROLE_TO_DOMAIN[role]
-  if (!allowedDomain) return null // e.g. doctor, lab_tech — no expense access
+  if (!allowedDomain) return null
 
   if (requestedDomain && requestedDomain !== allowedDomain) {
     return { mismatch: true, allowedDomain, requestedDomain }
@@ -77,22 +60,16 @@ function domainErrorResponse(res, resolved) {
   return null
 }
 
-// Write operations (create/update/delete) can never target "both tables at
-// once" — admin must say which domain explicitly. Combined mode is read-only,
-// for the overview/list/stats views.
 function requireSingleDomain(res, resolved) {
   if (resolved?.combined) {
     res.status(400).json({
-      error: "Specify a domain ('clinic' or 'pharmacy') for this action — admin oversight view is read-only across both",
+      error: "Specify a domain ('clinic' or 'pharmacy') for this action",
     })
     return true
   }
   return false
 }
 
-// Clinic expenses always have a recorder relation.
-// Pharmacy expenses also have one now (recorded_by added), so both can
-// safely include + shape the same way.
 function shapeExpense(e, domain) {
   return {
     id: e.id,
@@ -119,29 +96,18 @@ module.exports.getExpenses = async (req, res) => {
   const domainError = domainErrorResponse(res, resolved)
   if (domainError) return domainError
 
-  const {
-    page = 1,
-    limit = 20,
-    period = 'this_month',
-    search = '',
-  } = req.query
-
+  const { page, limit, period, search } = req.query
   const skip = (Number(page) - 1) * Number(limit)
 
   const where = {
     incurred_at: getPeriodRange(period),
-    ...(search.trim() && {
+    ...(search?.trim() && {
       description: { contains: search.trim(), mode: 'insensitive' },
     }),
   }
 
   try {
-    // ── Admin, no domain specified → combine clinic + pharmacy ──
     if (resolved.combined) {
-      // Pull both lists in full (unpaginated at the DB level), tag each row
-      // with its domain, merge, sort by date, then paginate in memory.
-      // This is fine at clinic data volumes; revisit with a UNION query
-      // or cursor-based approach if either table grows very large.
       const [clinicRows, pharmacyRows, clinicTotal, pharmacyTotal] = await Promise.all([
         MODELS.clinic.findMany({ where, include: RECORDER_INCLUDE, orderBy: { incurred_at: 'desc' } }),
         MODELS.pharmacy.findMany({ where, include: RECORDER_INCLUDE, orderBy: { incurred_at: 'desc' } }),
@@ -162,7 +128,6 @@ module.exports.getExpenses = async (req, res) => {
       })
     }
 
-    // ── Single domain (locked role, or admin with ?domain=) ──
     const [expenses, total] = await Promise.all([
       resolved.model.findMany({
         where,
@@ -190,11 +155,10 @@ module.exports.getExpenseStats = async (req, res) => {
   const domainError = domainErrorResponse(res, resolved)
   if (domainError) return domainError
 
-  const { period = 'this_month' } = req.query
+  const { period } = req.query
   const where = { incurred_at: getPeriodRange(period) }
 
   try {
-    // ── Admin, no domain specified → combine totals from both tables ──
     if (resolved.combined) {
       const [clinicAgg, pharmacyAgg] = await Promise.all([
         MODELS.clinic.aggregate({ where, _sum: { amount: true }, _count: { id: true } }),
@@ -215,7 +179,6 @@ module.exports.getExpenseStats = async (req, res) => {
       })
     }
 
-    // ── Single domain ──
     const aggregate = await resolved.model.aggregate({
       where,
       _sum: { amount: true },
@@ -243,19 +206,12 @@ module.exports.createExpense = async (req, res) => {
 
   const { description, amount, incurred_at } = req.body
 
-  if (!description?.trim()) {
-    return res.status(400).json({ error: 'Description is required' })
-  }
-  if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
-    return res.status(400).json({ error: 'Valid amount is required' })
-  }
-
   try {
     const expense = await resolved.model.create({
       data: {
-        description: description.trim(),
-        amount: Number(amount),
-        incurred_at: incurred_at ? new Date(incurred_at) : new Date(),
+        description,
+        amount,
+        incurred_at: incurred_at || new Date(),
         recorded_by: req.user.userId ?? null,
       },
       include: RECORDER_INCLUDE,
@@ -275,27 +231,16 @@ module.exports.updateExpense = async (req, res) => {
   if (domainError) return domainError
   if (requireSingleDomain(res, resolved)) return
 
-  const expenseId = Number(req.params.id)
-  if (!Number.isInteger(expenseId)) {
-    return res.status(400).json({ error: 'Invalid expense id' })
-  }
-
+  const { id } = req.params
   const { description, amount, incurred_at } = req.body
-
-  if (!description?.trim()) {
-    return res.status(400).json({ error: 'Description is required' })
-  }
-  if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
-    return res.status(400).json({ error: 'Valid amount is required' })
-  }
 
   try {
     const expense = await resolved.model.update({
-      where: { id: expenseId },
+      where: { id },
       data: {
-        description: description.trim(),
-        amount: Number(amount),
-        incurred_at: incurred_at ? new Date(incurred_at) : undefined,
+        description,
+        amount,
+        incurred_at: incurred_at || undefined,
       },
       include: RECORDER_INCLUDE,
     })
@@ -317,13 +262,10 @@ module.exports.deleteExpense = async (req, res) => {
   if (domainError) return domainError
   if (requireSingleDomain(res, resolved)) return
 
-  const expenseId = Number(req.params.id)
-  if (!Number.isInteger(expenseId)) {
-    return res.status(400).json({ error: 'Invalid expense id' })
-  }
+  const { id } = req.params
 
   try {
-    await resolved.model.delete({ where: { id: expenseId } })
+    await resolved.model.delete({ where: { id } })
     return res.json({ message: 'Expense deleted successfully' })
   } catch (error) {
     if (error.code === 'P2025') {

@@ -19,23 +19,21 @@ router.post('/login', async (req, res) => {
     })
 
     if (!user) {
-      return res.status(401).json({ error: 'Invalid credentials' })
+      return res.status(400).json({ error: 'Invalid credentials' })
     }
 
     const valid = await bcrypt.compare(password, user.password)
     if (!valid) {
-      return res.status(401).json({ error: 'Invalid credentials' })
+      return res.status(400).json({ error: 'Invalid credentials' })
     }
-
     const token = createToken(user)
 
     res.cookie('token', token, {
       httpOnly: true,
-      secure:   process.env.NODE_ENV === 'production',
+      secure:   false,
       sameSite: 'lax',
       maxAge:   8 * 60 * 60 * 1000,
     })
-
     res.json({
       user: {
         id:       user.id,
@@ -45,7 +43,7 @@ router.post('/login', async (req, res) => {
     })
 
   } catch (err) {
-    console.error('Login error:', err)
+    console.error('Login error:', err.message)
     res.status(500).json({ error: 'Server error' })
   }
 })

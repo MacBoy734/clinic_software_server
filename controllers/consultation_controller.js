@@ -1,17 +1,11 @@
-
-
 const prisma = require('../lib/prisma')
 const { getIO } = require('../utils/socket')
-const { writeAuditLog, createNotification, NOTIFICATION_TYPES } = require('../utils/helpers')
-const { getSettings } =   require('../lib/settings')
+const { writeAuditLog, createNotification, NOTIFICATION_TYPES, recomputeMedicationFee, BILLABLE_ITEM_STATUSES } = require('../utils/helpers')
 const pharmacy = require('./pharmacy_controller')
 
 const MEDICATION = pharmacy.MEDICATION
 
 const DOCTOR_ACTIONABLE_STATUSES = ['consultation_paid', 'with_doctor', 'lab', 'pharmacy']
-
-const FEE_EXCLUDED_ITEM_STATUSES = ['declined', 'returned', 'restocked', 'cancelled']
-
 
 function safeIO() {
   try { return getIO() } catch { return null }
@@ -23,6 +17,7 @@ function shapeVisit(v) {
     patient_id: v.patient_id,
     patient_name: v.patient?.name ?? null,
     patient_age: v.patient?.age ?? null,
+    patient_age_unit: v.patient?.age_unit ?? 'Years',
     patient_gender: v.patient?.gender ?? null,
     blood_group: v.patient?.blood_group ?? null,
     allergies: v.patient?.allergies ?? null,
@@ -39,24 +34,13 @@ function shapeVisit(v) {
     plan: v.plan ?? null,
     has_lab_results: v.has_lab_results,
     medication_verification: v.medication_verification,
-    // The consultation page reads this as "patient is back from pharmacy" —
-    // set true by the dispense flow, cleared when the doctor ends the visit.
     from_pharmacy: v.medication_verification,
-    procedure_name: v.procedure_name ?? null,
-    procedure_type: v.procedure_type ?? null,
-    procedure_notes: v.procedure_notes ?? null,
-    procedure_done_by: v.procedure_done_by ?? null,
     procedure_fee: v.bill?.procedure_fee ?? 0,
     consultation_fee: v.bill?.consultation_fee ?? 0,
     lab_fee: v.bill?.lab_fee ?? 0,
     medication_fee: v.bill?.medication_fee ?? 0,
-    bill_total:
-      (v.bill?.consultation_fee ?? 0) +
-      (v.bill?.lab_fee ?? 0) +
-      (v.bill?.medication_fee ?? 0) +
-      (v.bill?.procedure_fee ?? 0),
+    bill_total: v.bill?.total_amount ?? 0,
     arrived_at: v.arrived_at,
-    // Vitals — flattened for the ConsultationTab useEffect sync
     temperature: v.vitals?.temperature ?? null,
     bp_systolic: v.vitals?.bp_systolic ?? null,
     bp_diastolic: v.vitals?.bp_diastolic ?? null,
@@ -106,9 +90,11 @@ function shapePrescription(p) {
     verified_by: p.verified_by ?? null,
     verified_at: p.verified_at ?? null,
     returned_by: p.returned_by ?? null,
+    returned_at: p.returned_at ?? null,
     return_reason: p.return_reason ?? null,
     patient_name: p.visit?.patient?.name ?? null,
     patient_age: p.visit?.patient?.age ?? null,
+    patient_age_unit: p.visit?.patient?.age_unit ?? 'years',
     patient_gender: p.visit?.patient?.gender ?? null,
     items: (p.items ?? []).map((it) => ({
       id: it.id,
@@ -118,47 +104,26 @@ function shapePrescription(p) {
       duration: it.duration,
       quantity: it.quantity,
       unit_cost: it.unit_cost,
+      line_total: it.unit_cost * it.quantity,
       status: it.status,
       form: it.form ?? null,
       product_id: it.product_id ?? null,
-      drug_id: it.product_id ?? null, // legacy alias — drop once clients migrate
+      drug_id: it.product_id ?? null,
+      product_batch_id: it.product_batch_id ?? null,
       decline_reason: it.decline_reason ?? null,
       return_reason: it.return_reason ?? null,
+      restock_reject_reason: it.restock_reject_reason ?? null,
       dispensed_at: it.dispensed_at ?? null,
+      returned_by: it.returned_by ?? null,
+      returned_at: it.returned_at ?? null,
+      restocked_by: it.restocked_by ?? null,
+      restocked_at: it.restocked_at ?? null,
+      awaiting_restock: it.status === 'returned',
+      billable: BILLABLE_ITEM_STATUSES.includes(it.status),
     })),
   }
 }
 
-async function readMarkupPct(client = prisma) {
-  const settings = await getSettings()
-  return settings?.pharmacy_settings?.markup_pct ?? 0
-}
-
-async function recomputeMedicationFee(tx, visitId) {
-  const items = await tx.prescriptionItem.findMany({
-    where: {
-      prescription: { visit_id: visitId },
-      status: { notIn: FEE_EXCLUDED_ITEM_STATUSES },
-    },
-    select: { unit_cost: true, quantity: true },
-  })
-  const medFee = items.reduce((s, i) => s + i.unit_cost * i.quantity, 0)
-
-  const bill = await tx.bill.upsert({
-    where: { visit_id: visitId },
-    create: { visit_id: visitId, medication_fee: medFee },
-    update: { medication_fee: medFee },
-  })
-
-  // Keep the stored total in sync. (Schema debt: total_amount is derivable,
-  // and Bill still has no line items.)
-  return tx.bill.update({
-    where: { id: bill.id },
-    data: {
-      total_amount: bill.consultation_fee + bill.lab_fee + medFee + bill.procedure_fee,
-    },
-  })
-}
 
 // ─── Queue / visits ───────────────────────────────────────────────────────────
 
@@ -193,8 +158,7 @@ exports.getQueue = async (req, res) => {
 
 exports.getVisit = async (req, res) => {
   try {
-    const id = parseInt(req.params.id)
-    if (!id) return res.status(400).json({ error: 'missing visit ID' })
+    const id = req.params.id   // already coerced to number by validate({ params })
 
     const visit = await prisma.visit.findUnique({
       where: { id },
@@ -211,7 +175,7 @@ exports.getVisit = async (req, res) => {
       },
     })
     if (!visit) return res.status(404).json({ error: 'Visit not found' })
-
+    console.log('doctor: ', visit.doctor?.username)
     if (!DOCTOR_ACTIONABLE_STATUSES.includes(visit.status)) {
       return res.json({
         locked: true,
@@ -233,6 +197,7 @@ exports.getVisit = async (req, res) => {
 
 exports.getPatientDatabase = async (req, res) => {
   try {
+    // req.query is already validated and coerced by the route middleware
     const {
       search, gender, age_group, visit_type, diagnosis_code,
       has_allergies, date_from, date_to,
@@ -256,7 +221,6 @@ exports.getPatientDatabase = async (req, res) => {
     if (has_allergies === '1') patientWhere.allergies = { not: null }
     if (Object.keys(patientWhere).length) AND.push({ patient: patientWhere })
 
-    // date_to is inclusive (end of that day)
     if (date_from || date_to) {
       const range = {}
       if (date_from) range.gte = new Date(date_from)
@@ -337,9 +301,6 @@ exports.getPatientDatabase = async (req, res) => {
           weight: v.vitals?.weight_kg ?? null,
           height: v.vitals?.height_cm ?? null,
           spo2: v.vitals?.spo2 ?? null,
-
-          procedure_name: v.procedure_name ?? null,
-          procedure_type: v.procedure_type ?? null,
           from_pharmacy: v.medication_verification,
 
           consultation_fee: bill?.consultation_fee ?? 0,
@@ -358,8 +319,6 @@ exports.getPatientDatabase = async (req, res) => {
       })
       .filter((r) => !ageFilter || (r.patient_age != null && ageFilter(r.patient_age)))
 
-    // Diagnosis dropdown options, derived from the doctor's OWN data rather
-    // than a hardcoded catalogue.
     const diagMap = new Map()
     for (const r of records) {
       if (!r.diagnosis_code) continue
@@ -403,41 +362,22 @@ exports.getLabCatalog = async (req, res) => {
   }
 }
 
-exports.getProcedures = async (req, res) => {
-  try {
-    const templates = await prisma.chargeTemplate.findMany({
-      where: { is_active: true, category: { in: ['procedure', 'family_planning'] } },
-      orderBy: { name: 'asc' },
-    })
-    const shape = (t) => ({
-      id: t.id, name: t.name, price: t.amount, category: t.category, is_active: t.is_active,
-    })
-    res.json({
-      procedures: templates.filter((t) => t.category === 'procedure').map(shape),
-      familyPlanningMethods: templates.filter((t) => t.category === 'family_planning').map(shape),
-    })
-  } catch (err) {
-    console.error('getProcedures', err)
-    res.status(500).json({ error: 'Failed to fetch procedures' })
-  }
-}
-
 
 exports.getDrugs = async (req, res) => {
   try {
-    const [markupPct, drugs] = await Promise.all([
-      readMarkupPct(),
-      prisma.product.findMany({
-        where: {
-          category: MEDICATION,
-          is_active: true,
-          current_stock: { gt: 0 },
-        },
-        orderBy: { name: 'asc' },
-      }),
-    ])
-
-    const factor = 1 + markupPct / 100
+    const drugs = await prisma.product.findMany({
+      where: {
+        category: MEDICATION,
+        is_active: true,
+        current_stock: { gt: 0 },
+      },
+      orderBy: { name: 'asc' },
+      select: {
+        id: true, name: true, generic_name: true, sub_category: true,
+        form: true, strength: true, current_stock: true, unit: true,
+        normal_price: true,
+      },
+    })
 
     const items = drugs.map((d) => ({
       id: d.id,
@@ -445,47 +385,35 @@ exports.getDrugs = async (req, res) => {
       generic_name: d.generic_name ?? '',
       category: d.sub_category ?? '',
       sub_category: d.sub_category ?? '',
-      product_category: d.category,
       form: d.form ?? '',
       strength: d.strength ?? '',
       current_stock: d.current_stock,
-      reorder_level: d.reorder_level,
       unit: d.unit,
-      expiry_date: d.expiry_date,
-      pharmacy_normal_price: d.normal_price,
-      unit_price: Math.round(d.normal_price * factor),
+      unit_price: d.normal_price,
     }))
 
-    res.json({ items, markup_pct: markupPct })
+    res.json({ items })
   } catch (err) {
     console.error('getDrugs', err.message)
     res.status(500).json({ error: 'Failed to fetch drugs' })
   }
 }
 
-
 exports.getDrugStock = async (req, res) => {
   try {
-    const [markupPct, items] = await Promise.all([
-      readMarkupPct(),
-      prisma.product.findMany({
-        where: { category: MEDICATION, is_active: true },
-        orderBy: [{ name: 'asc' }],
-      }),
-    ])
-    const factor = 1 + markupPct / 100
+    const items = await prisma.product.findMany({
+      where: { category: MEDICATION, is_active: true },
+      orderBy: [{ name: 'asc' }],
+    })
 
     res.json({
       items: items.map((d) => ({
         id: d.id,
         name: d.name,
         generic_name: d.generic_name ?? '',
-        // Same reasoning as getDrugs: the tab's chips filter on `category`,
-        // which for a medication means its class.
         category: d.sub_category ?? '',
         sub_category: d.sub_category ?? '',
         product_category: d.category,
-        form: d.form ?? '',
         strength: d.strength ?? '',
         unit: d.unit,
         current_stock: d.current_stock,
@@ -493,10 +421,7 @@ exports.getDrugStock = async (req, res) => {
         expiry_date: d.expiry_date,
         batch_number: d.batch_number ?? null,
         pharmacy_normal_price: d.normal_price,
-        // What a prescription would charge the patient.
-        unit_price: Math.round(d.normal_price * factor),
       })),
-      markup_pct: markupPct,
     })
   } catch (err) {
     console.error('getDrugStock', err.message)
@@ -506,7 +431,7 @@ exports.getDrugStock = async (req, res) => {
 
 exports.getSupplies = async (req, res) => {
   try {
-    const q = typeof req.query.q === 'string' ? req.query.q.trim() : ''
+    const { q } = req.query
 
     const items = await prisma.product.findMany({
       where: {
@@ -514,12 +439,12 @@ exports.getSupplies = async (req, res) => {
         is_active: true,
         ...(q
           ? {
-              OR: [
-                { name: { contains: q, mode: 'insensitive' } },
-                { sub_category: { contains: q, mode: 'insensitive' } },
-                { sku: { contains: q, mode: 'insensitive' } },
-              ],
-            }
+            OR: [
+              { name: { contains: q, mode: 'insensitive' } },
+              { sub_category: { contains: q, mode: 'insensitive' } },
+              { sku: { contains: q, mode: 'insensitive' } },
+            ],
+          }
           : {}),
       },
       orderBy: [{ category: 'asc' }, { name: 'asc' }],
@@ -544,8 +469,6 @@ exports.getSupplies = async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch supplies' })
   }
 }
-
-
 
 exports.createPharmacyOrder = pharmacy.createInternalOrder
 
@@ -605,8 +528,7 @@ exports.getDoctorOrders = async (req, res) => {
 
 exports.getLabRequests = async (req, res) => {
   try {
-    const visitId = parseInt(req.params.id)
-    if (!visitId) return res.status(400).json({ error: 'missing visit ID' })
+    const visitId = req.params.id   // already coerced by validate({ params })
 
     const requests = await prisma.labRequest.findMany({
       where: { visit_id: visitId },
@@ -622,19 +544,9 @@ exports.getLabRequests = async (req, res) => {
 
 exports.orderLabTests = async (req, res) => {
   try {
-    const visitId = parseInt(req.params.id)
-    if (!visitId) return res.status(400).json({ error: 'missing visit ID' })
-
-    const { test_ids = [], urgency = 'routine' } = req.body
-    const ids = [...new Set((test_ids || []).map(Number))]
-    if (!ids.length) return res.status(400).json({ error: 'Select at least one test' })
-    if (ids.some((n) => !Number.isInteger(n) || n < 1)) {
-      return res.status(400).json({ error: 'Invalid test id' })
-    }
-    if (!['routine', 'urgent', 'stat'].includes(urgency)) {
-      return res.status(400).json({ error: 'Invalid urgency' })
-    }
-
+    const visitId = req.params.id   // already coerced
+    const { test_ids, urgency } = req.body   // already validated by validate({ body })
+    const ids = [...new Set(test_ids)]
     const doctorName = req.user?.username ?? 'Doctor'
 
     const request = await prisma.$transaction(async (tx) => {
@@ -720,15 +632,20 @@ exports.orderLabTests = async (req, res) => {
 
 exports.completeProcedure = async (req, res) => {
   const visitId = parseInt(req.params.id)
-  const { procedure_id, notes, doctor_name, price } = req.body
+  const { price } = req.body
   const ip = req.ip ?? null
   const currentUser = req.user
 
-  if (!visitId) return res.status(400).json({ error: 'missing visit ID' })
-  if (!procedure_id) return res.status(400).json({ error: 'procedure_id is required' })
-  const fee = Number(price)
-  if (!Number.isFinite(fee) || fee < 0) {
-    return res.status(400).json({ error: 'price must be a valid non-negative number' })
+  if (!Number.isInteger(visitId)) {
+    return res.status(400).json({ error: 'Invalid visit id' })
+  }
+
+  const procedurePrice = Math.round(Number(price))
+  if (!Number.isFinite(procedurePrice) || procedurePrice <= 0) {
+    return res.status(400).json({ error: 'Procedure fee must be a positive whole number' })
+  }
+  if (procedurePrice > 999_999_999) {
+    return res.status(400).json({ error: 'Fee exceeds maximum allowed amount' })
   }
 
   try {
@@ -738,77 +655,70 @@ exports.completeProcedure = async (req, res) => {
         include: { bill: true, patient: { select: { name: true } } },
       })
       if (!visit) throw Object.assign(new Error('Visit not found'), { status: 404 })
+      if (!visit.bill) throw Object.assign(new Error('Bill not found for this visit'), { status: 404 })
+
       if (!DOCTOR_ACTIONABLE_STATUSES.includes(visit.status)) {
         throw Object.assign(
           new Error(`Patient is at ${visit.status} and can no longer be updated from consultation.`),
           { status: 409 }
         )
       }
-      if (!visit.bill) throw Object.assign(new Error('Bill not found for this visit'), { status: 404 })
 
-      const template = await tx.chargeTemplate.findFirst({
-        where: {
-          id: Number(procedure_id),
-          is_active: true,
-          category: { in: ['procedure', 'family_planning'] },
-        },
-      })
-      if (!template) {
-        throw Object.assign(new Error('Selected procedure is invalid or inactive'), { status: 400 })
-      }
+      // ROW LOCK: prevents two updates at the same time
+      await tx.$executeRaw`SELECT * FROM bills WHERE id = ${visit.bill.id} FOR UPDATE`
 
-      await tx.visit.update({
-        where: { id: visitId },
-        data: {
-          procedure_name: template.name,
-          procedure_type: template.category,
-          procedure_notes: notes?.trim() || null,
-          procedure_done_by: doctor_name ?? currentUser?.username ?? 'Doctor',
-        },
-      })
+      const freshBill = await tx.bill.findUnique({ where: { id: visit.bill.id } })
+      const wasAlreadySet = freshBill.procedure_fee > 0
+      const oldFee = freshBill.procedure_fee || 0
 
       const bill = await tx.bill.update({
-        where: { visit_id: visitId },
+        where: { id: freshBill.id },
         data: {
-          procedure_fee: fee,
+          procedure_fee: procedurePrice,
           total_amount:
-            visit.bill.consultation_fee +
-            visit.bill.lab_fee +
-            visit.bill.medication_fee +
-            fee,
+            freshBill.consultation_fee +
+            freshBill.lab_fee +
+            freshBill.medication_fee +
+            procedurePrice,
         },
       })
 
-      return { bill, template }
+      return { bill, patientName: visit.patient?.name ?? 'patient', wasAlreadySet, oldFee }
     })
 
+    // Side effects
     try {
-      const edited = fee !== result.template.amount
       await writeAuditLog({
         staffId: currentUser?.id,
         user: currentUser?.username,
-        action: 'Procedure Added',
-        description: `${result.template.name} (${result.template.category}) added to visit #${visitId} for ${fee}${edited ? ` (template price ${result.template.amount}, edited)` : ''}`,
+        action: result.wasAlreadySet ? 'Procedure Fee Updated' : 'Procedure Fee Added',
+        description: result.wasAlreadySet
+          ? `Updated procedure fee from KES ${result.oldFee.toLocaleString()} to KES ${procedurePrice.toLocaleString()} on visit #${visitId}`
+          : `Added procedure fee of KES ${procedurePrice.toLocaleString()} to visit #${visitId}`,
         category: 'bill',
         entity: 'bill',
         entityId: result.bill.id,
         ipAddress: ip,
       })
       const io = safeIO()
-      if (io) io.to('receptionist').emit('bill:updated', { visit_id: visitId, bill: result.bill })
+      if (io) {
+        io.to('receptionist').emit('bill:updated', { visit_id: visitId, bill: result.bill })
+      }
     } catch (sideErr) {
-      console.error('completeProcedure post-commit side effect failed:', sideErr.message)
+      console.error('completeProcedure side effect failed:', sideErr.message)
     }
 
     return res.json({
       success: true,
-      message: `${result.template.name} added to bill`,
+      message: result.wasAlreadySet
+        ? `Procedure fee updated to KES ${procedurePrice.toLocaleString()}`
+        : `Procedure fee of KES ${procedurePrice.toLocaleString()} added to bill`,
       bill: result.bill,
     })
   } catch (err) {
     if (err.status) return res.status(err.status).json({ error: err.message })
     console.error('completeProcedure error:', err.message)
-    return res.status(500).json({ error: 'Failed to add procedure' })
+    return res.status(500).json({ error: 'Failed to save procedure fee' })
   }
 }
 
@@ -816,65 +726,44 @@ exports.completeProcedure = async (req, res) => {
 
 exports.getPrescriptions = async (req, res) => {
   try {
-    const visitId = parseInt(req.params.id)
-    if (!visitId) return res.status(400).json({ error: 'missing visit ID' })
+    const visitId = req.params.id
 
     const prescriptions = await prisma.prescription.findMany({
       where: { visit_id: visitId },
-      include: { items: true, visit: { include: { patient: true } } },
+      include: { items: { orderBy: { id: 'asc' } }, visit: { include: { patient: true } } },
       orderBy: { created_at: 'desc' },
     })
+
     res.json({ prescriptions: prescriptions.map(shapePrescription) })
   } catch (err) {
-    console.error('getPrescriptions', err)
+    console.error('getPrescriptions', err.message)
     res.status(500).json({ error: 'Failed to fetch prescriptions' })
   }
 }
 
-
 exports.createPrescription = async (req, res) => {
   try {
-    const visitId = parseInt(req.params.id)
+    const visitId = req.params.id
     const { items = [], notes } = req.body
-    const ip = req.ip ?? null
     const currentUser = req.user
+    const ip = req.ip ?? null
 
-    if (!visitId) return res.status(400).json({ error: 'missing visit ID' })
-    if (!Array.isArray(items) || !items.length) {
-      return res.status(400).json({ error: 'Add at least one medication' })
-    }
-
-    const norm = []
-    for (const it of items) {
-      const medication = typeof it.medication === 'string' ? it.medication.trim() : ''
-      const rawId = it.product_id ?? it.drug_id
-      const productId = rawId != null && rawId !== '' ? Number(rawId) : null
-      const quantity = parseInt(it.quantity)
-
-      if (!medication && productId == null) {
-        return res.status(400).json({ error: 'Every line needs a medication' })
-      }
-      if (!Number.isInteger(quantity) || quantity <= 0) {
-        return res.status(400).json({ error: 'Every line needs a positive whole-number quantity' })
-      }
-
-      norm.push({
-        productId: Number.isInteger(productId) && productId > 0 ? productId : null,
-        medication,
-        dosage: it.dosage ?? '',
-        frequency: it.frequency ?? '',
-        duration: it.duration ?? '',
-        quantity,
-        form: it.form === 'injection' ? 'injection' : 'oral',
-        clientCost: Math.max(0, parseInt(it.unit_cost) || 0),
-      })
-    }
+    const lines = items.map((it) => ({
+      productId: Number(it.product_id ?? it.drug_id),
+      dosage: it.dosage ?? '',
+      frequency: it.frequency ?? '',
+      duration: it.duration ?? '',
+      quantity: Number(it.quantity),
+      unitCost: Number(it.unit_cost),
+      form: it.form || 'oral',
+    }))
 
     const result = await prisma.$transaction(async (tx) => {
       const visit = await tx.visit.findUnique({
         where: { id: visitId },
         select: {
-          id: true, status: true,
+          id: true,
+          status: true,
           lab_requests: { select: { status: true } },
           patient: { select: { name: true } },
         },
@@ -887,77 +776,89 @@ exports.createPrescription = async (req, res) => {
         )
       }
 
-      const ids = norm.filter((n) => n.productId != null).map((n) => n.productId)
-      const products = ids.length
-        ? await tx.product.findMany({ where: { id: { in: ids } } })
-        : []
+      const productIds = [...new Set(lines.map((l) => l.productId))]
+      const products = await tx.product.findMany({
+        where: { id: { in: productIds } },
+        select: { id: true, name: true, category: true, is_active: true, current_stock: true },
+      })
       const byId = new Map(products.map((p) => [p.id, p]))
 
-      // The control. Not the picker.
-      const blocked = norm
-        .filter((n) => n.productId != null)
-        .filter((n) => {
-          const p = byId.get(n.productId)
-          return !p || !p.is_active || p.category !== MEDICATION
-        })
-      if (blocked.length) {
+      const unusable = productIds.filter((id) => {
+        const p = byId.get(id)
+        return !p || !p.is_active || p.category !== MEDICATION
+      })
+      if (unusable.length) {
         throw Object.assign(
           new Error(
-            `Only medications can be prescribed — remove: ${blocked
-              .map((n) => byId.get(n.productId)?.name ?? (n.medication || `#${n.productId}`))
+            `Only active medications in stock can be prescribed — remove: ${unusable
+              .map((id) => byId.get(id)?.name ?? `#${id}`)
               .join(', ')}`
           ),
           { status: 400 }
         )
       }
 
-      const markupPct = await readMarkupPct(tx)
-      const factor = 1 + markupPct / 100
+      // Aggregate per product: two lines of 5 against a stock of 6 each pass an
+      // independent check, but the order draws 10 from one pool.
+      const requested = new Map()
+      for (const l of lines) {
+        requested.set(l.productId, (requested.get(l.productId) ?? 0) + l.quantity)
+      }
+      for (const [productId, qty] of requested) {
+        const p = byId.get(productId)
+        if (qty > p.current_stock) {
+          throw Object.assign(
+            new Error(`Insufficient stock for ${p.name} — ${p.current_stock} available, ${qty} requested`),
+            { status: 409 }
+          )
+        }
+      }
 
+      // product_batch_id stays null — the batch is a FEFO pick the pharmacist
+      // makes at dispense.
       const created = await tx.prescription.create({
         data: {
           visit_id: visitId,
-          prescribed_by: currentUser?.username,
+          prescribed_by: currentUser?.username ?? null,
           status: 'pending',
-          notes: (typeof notes === 'string' && notes.trim()) || null,
+          notes: notes?.trim() || null,
           items: {
-            create: norm.map((n) => {
-              const p = n.productId != null ? byId.get(n.productId) : null
-              return {
-                product_id: n.productId,
-                // Snapshot — the line still reads correctly after a rename.
-                drug_name: p ? p.name : n.medication,
-                dosage: n.dosage,
-                frequency: n.frequency,
-                duration: n.duration,
-                quantity: n.quantity,
-                // Server-resolved charge. Custom (unstocked) lines fall back
-                // to what the doctor typed.
-                unit_cost: p ? Math.round(p.normal_price * factor) : n.clientCost,
-                form: p?.form === 'injection' ? 'injection' : n.form,
-                status: 'pending',
-              }
-            }),
+            create: lines.map((l) => ({
+              product_id: l.productId,
+              drug_name: byId.get(l.productId).name,
+              dosage: l.dosage,
+              frequency: l.frequency,
+              duration: l.duration,
+              quantity: l.quantity,
+              unit_cost: l.unitCost,
+              form: l.form,
+              status: 'pending',
+            })),
           },
         },
-        include: { items: true, visit: { include: { patient: true } } },
+        include: { items: { orderBy: { id: 'asc' } }, visit: { include: { patient: true } } },
       })
 
-      await recomputeMedicationFee(tx, visitId)
+      // No fee recompute: items are created `pending`, which is not billable.
+      // The fee is written when the pharmacy dispenses.
 
-      // Move to pharmacy if the consultation is done and no lab is pending.
-      const hasActiveLab = visit.lab_requests.some(
+      const labsOutstanding = visit.lab_requests.some(
         (r) => r.status === 'pending' || r.status === 'in_progress'
       )
-      if (visit.status === 'with_doctor' && !hasActiveLab) {
+      if (visit.status === 'with_doctor' && !labsOutstanding) {
         await tx.visit.update({ where: { id: visitId }, data: { status: 'pharmacy' } })
       }
 
       return { prescription: created, patientName: visit.patient?.name ?? 'patient' }
     })
 
-    const io = safeIO()
+    const shaped = shapePrescription(result.prescription)
+
     try {
+      const io = safeIO()
+      // Emit before the notification insert: a failing insert must not cost the
+      // pharmacist their live update.
+      if (io) io.to('pharmacist').emit('prescription:new', { visit_id: visitId, prescription: shaped })
       await createNotification({
         targetRoles: ['pharmacist'],
         type: NOTIFICATION_TYPES.RX_NEW,
@@ -970,35 +871,30 @@ exports.createPrescription = async (req, res) => {
         staffId: currentUser?.id,
         user: currentUser?.username,
         action: 'created_prescription',
-        description: `Created prescription #${result.prescription.id} for visit #${visitId}`,
+        description: `Created prescription #${result.prescription.id} (${shaped.items.length} items) for visit #${visitId}`,
         category: 'prescription',
         entity: 'prescription',
         entityId: result.prescription.id,
         ipAddress: ip,
       })
-      if (io) {
-        io.to('pharmacist').emit('prescription:new', {
-          prescription: shapePrescription(result.prescription),
-        })
-      }
     } catch (sideErr) {
-      console.error('createPrescription post-commit side effect failed:', sideErr.message)
+      console.error('createPrescription side effect failed:', sideErr.message)
     }
 
-    res.json({ success: true, prescription: shapePrescription(result.prescription) })
+    res.json({ success: true, prescription: shaped })
   } catch (err) {
     if (err.status) return res.status(err.status).json({ error: err.message })
-    console.error('createPrescription error: ', err.message)
+    console.error('createPrescription', err.message)
     res.status(500).json({ error: 'Failed to create prescription' })
   }
 }
 
 exports.patchVisit = async (req, res) => {
   try {
-    const id = parseInt(req.params.id)
+    const id = req.params.id
     const body = req.body
 
-    const existing = await prisma.visit.findUnique({ where: { id }, select: { status: true } })
+    const existing = await prisma.visit.findUnique({ where: { id }, select: { status: true, doctor_id: true } })
     if (!existing) return res.status(404).json({ error: 'Visit not found' })
     if (!DOCTOR_ACTIONABLE_STATUSES.includes(existing.status)) {
       return res.status(409).json({
@@ -1006,26 +902,26 @@ exports.patchVisit = async (req, res) => {
       })
     }
 
-    // ── Vitals fields — split off and upserted separately ──────────────────
+    // ── Vitals fields ──────────────────────────────────────────────────────
     const VITAL_KEYS = [
       'temperature', 'bp_systolic', 'bp_diastolic', 'pulse',
       'respiratory_rate', 'weight', 'height', 'spo2', 'vitals_notes',
     ]
     const vitalsPayload = {}
     VITAL_KEYS.forEach((k) => {
-      if (k in body) vitalsPayload[k] = body[k] === '' ? null : body[k]
+      if (k in body) vitalsPayload[k] = body[k]
     })
 
     const vitalsMap = { weight: 'weight_kg', height: 'height_cm' }
     const prismaVitals = {}
     Object.entries(vitalsPayload).forEach(([k, v]) => {
       const col = vitalsMap[k] || k
-      prismaVitals[col] = v === null ? null : isNaN(Number(v)) ? v : Number(v)
+      prismaVitals[col] = v
     })
 
     // ── Visit-level fields ────────────────────────────────────────────────
     const VISIT_KEYS = [
-      'status', 'doctor_id', 'chief_complaint',
+      'status', 'chief_complaint',
       'subjective', 'objective', 'assessment', 'plan',
       'diagnosis', 'diagnosis_code', 'notes',
       'has_lab_results', 'medication_verification',
@@ -1035,17 +931,33 @@ exports.patchVisit = async (req, res) => {
       if (k in body) visitPayload[k] = body[k]
     })
 
-    // The consultation page sends from_pharmacy:false on end-consultation.
-    if ('from_pharmacy' in body) {
-      visitPayload.medication_verification = !!body.from_pharmacy
-    }
-
     if (body.status === 'with_doctor' && req.user?.id) {
-      visitPayload.doctor_id = req.user.id
+      if (!existing.doctor_id) {
+        visitPayload.doctor_id = req.user?.id
+      }
     }
 
-    // One transaction, not Promise.all — a failed vitals upsert should not
-    // leave the visit row already updated.
+    // ── Business rule: cannot end consultation with pending work ──────────
+    if (body.status === 'billing') {
+      const pendingLabs = await prisma.labRequestItem.count({
+        where: {
+          lab_request: { visit_id: id },
+          status: { in: ['pending', 'in_progress'] },
+        },
+      })
+      const pendingRx = await prisma.prescriptionItem.count({
+        where: {
+          prescription: { visit_id: id },
+          status: 'pending',
+        },
+      })
+      if (pendingLabs > 0 || pendingRx > 0) {
+        return res.status(409).json({
+          error: 'Cannot end consultation with pending labs or medications',
+        })
+      }
+    }
+
     await prisma.$transaction(async (tx) => {
       if (Object.keys(prismaVitals).length > 0) {
         await tx.vitals.upsert({
@@ -1066,69 +978,103 @@ exports.patchVisit = async (req, res) => {
   }
 }
 
-
 exports.returnPrescriptionItem = async (req, res) => {
   try {
-    const prescriptionId = parseInt(req.params.id)
+    const prescriptionId = req.params.id
     const { item_id, reason } = req.body
     const currentUser = req.user
     const ip = req.ip ?? null
-
-    if (!item_id || !reason?.trim()) {
-      return res.status(400).json({ error: 'item_id and reason are required' })
-    }
+    const returnReason = reason.trim()
 
     const result = await prisma.$transaction(async (tx) => {
+      // Lock first: two tabs would otherwise both read `issued`, both decrement
+      // the bill, and queue two restocks.
+      await tx.$executeRaw`SELECT id FROM prescription_items WHERE id = ${item_id} FOR UPDATE`
+
       const item = await tx.prescriptionItem.findFirst({
-        where: { id: parseInt(item_id), prescription_id: prescriptionId },
+        where: { id: item_id, prescription_id: prescriptionId },
         include: { prescription: { select: { visit_id: true } } },
       })
       if (!item) throw Object.assign(new Error('Item not found'), { status: 404 })
+
+      const visitId = item.prescription.visit_id
+      const visit = await tx.visit.findUnique({ where: { id: visitId }, select: { status: true } })
+      if (!DOCTOR_ACTIONABLE_STATUSES.includes(visit.status)) {
+        throw Object.assign(
+          new Error(`Patient is at ${visit.status} and can no longer be managed from consultation.`),
+          { status: 409 }
+        )
+      }
+
       if (item.status !== 'issued') {
         throw Object.assign(
-          new Error(`Only issued (dispensed) items can be returned. This item is "${item.status}".`),
+          new Error(`Only issued (dispensed) items can be returned. ${item.drug_name} is "${item.status}".`),
           { status: 409 }
         )
       }
 
       await tx.prescriptionItem.update({
         where: { id: item.id },
-        data: { status: 'returned', return_reason: reason.trim() },
+        data: {
+          status: 'returned',
+          return_reason: returnReason,
+          returned_by: currentUser?.username ?? null,   // session, never req.body
+          returned_at: new Date(),
+          restock_reject_reason: null,
+        },
+      })
+      await recomputeMedicationFee(tx, visitId)
+      const remainingItems = await tx.prescriptionItem.count({
+        where: {
+          prescription_id: prescriptionId,
+          status: { in: ['issued', 'pending'] },
+        },
       })
 
-      await recomputeMedicationFee(tx, item.prescription.visit_id)
+      if (remainingItems === 0) {
+        await tx.prescription.update({
+          where: { id: prescriptionId },
+          data: {
+            status: 'returned',
+            returned_by: currentUser?.username ?? null,
+            returned_at: new Date(),
+            return_reason: 'All items returned by doctor',
+          },
+        })
+      }
 
-      return { visitId: item.prescription.visit_id, drugName: item.drug_name, itemId: item.id }
+      return { visitId, itemId: item.id, drugName: item.drug_name, quantity: item.quantity }
     })
 
-    const io = safeIO()
     try {
+      const io = safeIO()
+      if (io) {
+        io.to('pharmacist').emit('prescription:returned', {
+          visit_id: result.visitId,
+          prescription_id: prescriptionId,
+          item_id: result.itemId,
+          returned_by: currentUser?.username,
+          reason: returnReason,
+        })
+      }
       await createNotification({
         targetRoles: ['pharmacist'],
         type: NOTIFICATION_TYPES.RX_RETURNED,
         title: 'Prescription item returned',
         visitId: result.visitId,
-        message: `${result.drugName} was returned from visit #${result.visitId}. Reason: ${reason.trim()}`,
+        message: `${result.drugName} ×${result.quantity} returned from visit #${result.visitId}. Reason: ${returnReason}`,
         io,
       })
       await writeAuditLog({
         staffId: currentUser?.id,
         user: currentUser?.username,
         action: 'return_prescription_item',
-        description: `Returned ${result.drugName} on visit #${result.visitId}: ${reason.trim()}`,
+        description: `Returned ${result.drugName} ×${result.quantity} on visit #${result.visitId}: ${returnReason}`,
         category: 'prescription',
         entity: 'prescription_item',
         entityId: result.itemId,
         ipAddress: ip,
       })
-      if (io) {
-        io.to('pharmacist').emit('prescription:returned', {
-          prescription_id: prescriptionId,
-          item_id: result.itemId,
-          returned_by: currentUser?.username,
-          reason: reason.trim(),
-        })
-      }
     } catch (sideErr) {
       console.error('returnPrescriptionItem side effect failed:', sideErr.message)
     }
@@ -1143,80 +1089,116 @@ exports.returnPrescriptionItem = async (req, res) => {
 
 exports.returnPrescription = async (req, res) => {
   try {
-    const id = parseInt(req.params.id)
-    const { doctor_name, reason } = req.body
+    const prescriptionId = req.params.id
+    const { reason } = req.body
     const currentUser = req.user
     const ip = req.ip ?? null
+    const returnReason = reason.trim()
 
-    if (!Number.isInteger(id)) return res.status(400).json({ error: 'Prescription ID is required' })
-    if (!reason?.trim()) return res.status(400).json({ error: 'reason is required' })
-
-    const prescription = await prisma.$transaction(async (tx) => {
+    const result = await prisma.$transaction(async (tx) => {
       const existing = await tx.prescription.findUnique({
-        where: { id },
+        where: { id: prescriptionId },
         select: { id: true, status: true, visit_id: true },
       })
       if (!existing) throw Object.assign(new Error('Prescription not found'), { status: 404 })
-      if (!['issued', 'dispensed'].includes(existing.status)) {
+      if (!['issued'].includes(existing.status)) {
         throw Object.assign(
-          new Error(`Only a dispensed prescription can be returned. This one is "${existing.status}".`),
+          new Error(`Only an issued prescription can be returned. This one is "${existing.status}".`),
           { status: 409 }
         )
       }
 
-      const p = await tx.prescription.update({
-        where: { id },
-        data: {
-          status: 'returned',
-          returned_by: doctor_name ?? currentUser?.username ?? 'Doctor',
-          returned_at: new Date(),
-          return_reason: reason.trim(),
-        },
-        include: { visit: { include: { patient: { select: { name: true } } } } },
+      const visit = await tx.visit.findUnique({
+        where: { id: existing.visit_id },
+        select: { status: true },
       })
+      if (!DOCTOR_ACTIONABLE_STATUSES.includes(visit.status)) {
+        throw Object.assign(
+          new Error(`Patient is at ${visit.status} and can no longer be managed from consultation.`),
+          { status: 409 }
+        )
+      }
+
+      await tx.$executeRaw`SELECT id FROM prescription_items WHERE prescription_id = ${prescriptionId} FOR UPDATE`
+
+      const issuedCount = await tx.prescriptionItem.count({
+        where: { prescription_id: prescriptionId, status: 'issued' },
+      })
+      if (issuedCount === 0) {
+        throw Object.assign(
+          new Error('No dispensed items left to return on this prescription.'),
+          { status: 409 }
+        )
+      }
+
+      const now = new Date()
 
       await tx.prescriptionItem.updateMany({
-        where: { prescription_id: id, status: 'issued' },
-        data: { status: 'returned', return_reason: reason.trim() },
+        where: { prescription_id: prescriptionId, status: 'issued' },
+        data: {
+          status: 'returned',
+          return_reason: returnReason,
+          returned_by: currentUser?.username ?? null,
+          returned_at: now,
+          restock_reject_reason: null,
+        },
+      })
+
+      const prescription = await tx.prescription.update({
+        where: { id: prescriptionId },
+        data: {
+          status: 'returned',
+          returned_by: currentUser?.username ?? null,
+          returned_at: now,
+          return_reason: returnReason,
+        },
+        include: { visit: { select: { patient: { select: { name: true } } } } },
       })
 
       await recomputeMedicationFee(tx, existing.visit_id)
 
-      await tx.visit.update({
-        where: { id: existing.visit_id },
-        data: { status: 'pharmacy' },
-      })
+      // Only pull the visit back when the doctor still holds it. Forcing
+      // `pharmacy` unconditionally dragged visits out of billing and clobbered
+      // an in-progress lab stage.
+      if (visit.status === 'with_doctor') {
+        await tx.visit.update({ where: { id: existing.visit_id }, data: { status: 'pharmacy' } })
+      }
 
-      return p
+      return {
+        visitId: existing.visit_id,
+        itemCount: issuedCount,
+        patientName: prescription.visit?.patient?.name ?? 'patient',
+      }
     })
 
-    const io = safeIO()
     try {
+      const io = safeIO()
+      if (io) {
+        io.to('pharmacist').emit('prescription:returned', {
+          visit_id: result.visitId,
+          prescription_id: prescriptionId,
+          returned_by: currentUser?.username,
+          reason: returnReason,
+        })
+      }
       await createNotification({
         targetRoles: ['pharmacist'],
         type: NOTIFICATION_TYPES.RX_RETURNED,
         title: 'Prescription returned',
-        visitId: prescription.visit_id,
-        message: `Prescription #${prescription.id} for ${prescription.visit?.patient?.name ?? 'patient'} was returned. Reason: ${reason.trim()}`,
+        visitId: result.visitId,
+        message: `Prescription #${prescriptionId} (${result.itemCount} item${result.itemCount > 1 ? 's' : ''}) for ${result.patientName} was returned. Reason: ${returnReason}`,
         io,
       })
       await writeAuditLog({
         staffId: currentUser?.id,
         user: currentUser?.username,
         action: 'return_prescription',
-        description: `Returned prescription #${prescription.id} on visit #${prescription.visit_id}: ${reason.trim()}`,
+        description: `Returned prescription #${prescriptionId} (${result.itemCount} items) on visit #${result.visitId}: ${returnReason}`,
         category: 'prescription',
         entity: 'prescription',
-        entityId: prescription.id,
+        entityId: prescriptionId,
         ipAddress: ip,
       })
-      if (io) {
-        io.to('pharmacist').emit('prescription:returned', {
-          prescription_id: prescription.id,
-          returned_by: currentUser?.username,
-          reason: reason.trim(),
-        })
-      }
     } catch (sideErr) {
       console.error('returnPrescription side effect failed:', sideErr.message)
     }
@@ -1226,147 +1208,5 @@ exports.returnPrescription = async (req, res) => {
     if (err.status) return res.status(err.status).json({ error: err.message })
     console.error('returnPrescription', err.message)
     res.status(500).json({ error: 'Failed to return prescription' })
-  }
-}
-
-
-exports.confirmRestock = async (req, res) => {
-  try {
-    const itemId = parseInt(req.params.id)
-    const currentUser = req.user
-    if (!Number.isInteger(itemId)) return res.status(400).json({ error: 'missing item ID' })
-
-    const result = await prisma.$transaction(async (tx) => {
-      const item = await tx.prescriptionItem.findUnique({
-        where: { id: itemId },
-        include: { prescription: { select: { visit_id: true } } },
-      })
-      if (!item) throw Object.assign(new Error('Item not found'), { status: 404 })
-      if (item.status !== 'returned') {
-        throw Object.assign(
-          new Error(`Only returned items can be restocked. This item is "${item.status}".`),
-          { status: 409 }
-        )
-      }
-
-      await tx.prescriptionItem.update({
-        where: { id: itemId },
-        data: { status: 'restocked' },
-      })
-
-      let stockRestored = false
-      if (item.product_id) {
-        await pharmacy._giveStock(tx, {
-          productId: item.product_id,
-          quantity: item.quantity,
-          reason: 'return_to_stock',
-          refType: 'prescription_item',
-          refId: item.id,
-          staffId: currentUser?.id,
-          note: `Returned from visit #${item.prescription.visit_id}`,
-        })
-        stockRestored = true
-      }
-      // No product_id → custom-typed medication; marked restocked with no
-      // stock movement, because there is nothing to increment.
-
-      return { stockRestored, drugName: item.drug_name, quantity: item.quantity }
-    })
-
-    try {
-      await writeAuditLog({
-        staffId: req.user?.id,
-        user: req.user?.username,
-        action: 'confirm_restock',
-        description: `${result.drugName} ×${result.quantity} ${result.stockRestored ? 'returned to stock' : 'marked restocked (no linked product)'}`,
-        category: 'stock',
-        entity: 'prescription_item',
-        entityId: itemId,
-        ipAddress: req.ip ?? null,
-      })
-    } catch (e) { console.error('writeAuditLog failed:', e.message) }
-
-    res.json({
-      success: true,
-      stock_restored: result.stockRestored,
-      message: result.stockRestored
-        ? `${result.drugName} restocked (+${result.quantity})`
-        : `${result.drugName} marked restocked (no linked stock item)`,
-    })
-  } catch (err) {
-    if (err.status) return res.status(err.status).json({ error: err.message })
-    console.error('confirmRestock', err)
-    res.status(500).json({ error: 'Failed to confirm restock' })
-  }
-}
-
-
-exports.verifyPrescription = async (req, res) => {
-  try {
-    const id = parseInt(req.params.id)
-    const { doctor_name, notes } = req.body
-    const currentUser = req.user
-    if (!Number.isInteger(id)) return res.status(400).json({ error: 'Prescription ID is required' })
-
-    const prescription = await prisma.$transaction(async (tx) => {
-      const existing = await tx.prescription.findUnique({
-        where: { id },
-        select: { id: true, status: true, visit_id: true },
-      })
-      if (!existing) throw Object.assign(new Error('Prescription not found'), { status: 404 })
-      if (existing.status === 'cancelled') {
-        throw Object.assign(new Error('A cancelled prescription cannot be verified'), { status: 409 })
-      }
-
-      const p = await tx.prescription.update({
-        where: { id },
-        data: {
-          status: 'issued',
-          verified_by: doctor_name ?? currentUser?.username ?? 'Doctor',
-          verified_at: new Date(),
-          verify_notes: notes ?? null,
-        },
-      })
-
-      await tx.prescriptionItem.updateMany({
-        where: { prescription_id: id, status: 'pending' },
-        data: { status: 'issued' },
-      })
-
-      await recomputeMedicationFee(tx, existing.visit_id)
-
-      await tx.visit.update({
-        where: { id: existing.visit_id },
-        data: { medication_verification: false, status: 'billing' },
-      })
-
-      return p
-    })
-
-    try {
-      await writeAuditLog({
-        staffId: currentUser?.id,
-        user: currentUser?.username,
-        action: 'verify_prescription',
-        description: `Verified prescription #${id} on visit #${prescription.visit_id}`,
-        category: 'prescription',
-        entity: 'prescription',
-        entityId: id,
-        ipAddress: req.ip ?? null,
-      })
-      const io = safeIO()
-      if (io) {
-        io.to('receptionist').emit('visit:status_changed', {
-          visitId: prescription.visit_id,
-          status: 'billing',
-        })
-      }
-    } catch (e) { console.error('verifyPrescription side effect failed:', e.message) }
-
-    res.json({ success: true })
-  } catch (err) {
-    if (err.status) return res.status(err.status).json({ error: err.message })
-    console.error('verifyPrescription', err)
-    res.status(500).json({ error: 'Failed to verify prescription' })
   }
 }
