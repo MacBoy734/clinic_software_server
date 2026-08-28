@@ -24,6 +24,7 @@ function shapeRequest(r) {
     // Patient info joined from visit → patient
     patient_name: r.visit?.patient?.name ?? null,
     patient_age: r.visit?.patient?.age ?? null,
+    age_unit: r.visit?.patient?.age_unit ?? 'Year',
     patient_gender: r.visit?.patient?.gender ?? null,
     blood_group: r.visit?.patient?.blood_group ?? null,
     allergies: r.visit?.patient?.allergies ?? null,
@@ -148,7 +149,7 @@ exports.getQueue = async (req, res) => {
     const requests = await prisma.labRequest.findMany({
       where: { status: { in: ['pending', 'in_progress'] } },
       include: REQUEST_INCLUDE,
-      orderBy: { requested_at: 'asc' },
+      orderBy: { requested_at: 'desc' },
     })
 
     const sorted = requests

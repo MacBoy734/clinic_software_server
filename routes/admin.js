@@ -2,6 +2,8 @@ const express = require('express')
 const c = require('../controllers/admin_controller')
 const router = express.Router()
 const { authenticate, authorize } = require('../middleware/auth')
+const schemas = require('../utils/schemaValidations')
+const validate = require('../middleware/validate') 
 
 // allow other users to access settings
 router.get('/settings', authenticate, c.getSettings)
@@ -38,6 +40,14 @@ router.get('/bills/queue', c.getBillingQueueToday)
 router.get('/payments', c.getPayments)
 router.get('/revenue/week', c.getRevenueWeek)
 router.get('/finance/revenue', c.getRevenueReport)
+router.get('/products/:id', validate({ params: schemas.idParamSchema }), c.getProductDetail)
+router.get('/products/:id/movements', validate({ params: schemas.idParamSchema }), c.getProductMovements)
+
+// ── Pharmacy finance ──────────────────────────────────────────────────────────
+router.get('/pharmacy/finance-overview', c.getPharmacyFinanceOverview)
+router.get('/pharmacy/sales', c.getPharmacySales)
+router.get('/pharmacy/debt-book', c.getDebtBook)
+router.post('/pharmacy/customer-payments', c.collectCustomerPayment)
 
 // POST routes
 router.post('/referrals', c.createReferral)
@@ -69,6 +79,7 @@ router.delete('/drug-stock/:id', c.deleteDrugStockItem)
 router.delete('/charge-templates/:id', c.deleteChargeTemplate)
 router.delete('/sessions/:id', c.deleteSession)
 router.delete('/lab-stock/:id', c.deleteLabStockItem)
+
 
 
 

@@ -175,7 +175,6 @@ exports.getVisit = async (req, res) => {
       },
     })
     if (!visit) return res.status(404).json({ error: 'Visit not found' })
-    console.log('doctor: ', visit.doctor?.username)
     if (!DOCTOR_ACTIONABLE_STATUSES.includes(visit.status)) {
       return res.json({
         locked: true,

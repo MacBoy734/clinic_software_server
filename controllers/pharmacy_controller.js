@@ -311,6 +311,7 @@ function shapeProduct(p) {
     pharmacy_normal_price: p.normal_price, // legacy alias
     promotional_price: p.promotional_price,
     wholesale_price: p.wholesale_price,
+    shelf_location: p.shelf_location ?? null,
     supplier: p.supplier ?? null,
     stock_value: p.current_stock * p.normal_price,
     updated_at: p.updated_at,
@@ -731,7 +732,7 @@ exports.getQueue = async (req, res) => {
       }),
       prisma.prescription.count({
         where: {
-          status: { in: ['dispensed', 'issued'] },
+          status: { in: ['issued'] },
           dispensed_at: { gte: todayStart },
         },
       }),
@@ -1779,5 +1780,37 @@ exports.getCustomers = async (req, res) => {
   } catch (err) {
     console.error('getCustomers', err.message)
     res.status(500).json({ error: 'Failed to fetch customers' })
+  }
+}
+
+exports.updateShelfLocation = async (req, res) => {
+  try {
+    const id = req.params.id
+
+    const { shelf_location } = req.body
+    if (shelf_location === undefined) {
+      return res.status(400).json({ error: 'shelf_location is required' })
+    }
+
+    const updated = await prisma.product.update({
+      where: { id },
+      data: {
+        shelf_location: String(shelf_location).trim() || null,
+      },
+    })
+
+    res.json({
+      success: true,
+      product: {
+        id: updated.id,
+        shelf_location: updated.shelf_location,
+      },
+    })
+  } catch (err) {
+    console.error('PATCH /pharmacy/stock/:id error:', err.message)
+    if (err.code === 'P2025') {
+      return res.status(404).json({ error: 'Product not found' })
+    }
+    res.status(500).json({ error: 'Failed to update shelf location' })
   }
 }

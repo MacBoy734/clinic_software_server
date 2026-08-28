@@ -13,48 +13,46 @@ const prisma = require('../lib/prisma')
 // DATE / PERIOD HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Returns a Prisma { gte, lte } range for a named period.
- * Used in almost every list endpoint that supports period filtering.
- *
- * @param {'today'|'this_week'|'this_month'|'this_year'|'last_30_days'} period
- */
 function getPeriodRange(period) {
   const now = new Date()
-  const start = new Date()
+  const start = new Date(now)
   start.setHours(0, 0, 0, 0)
 
   switch (period) {
-    case 'today': break
-    case 'this_week': start.setDate(now.getDate() - now.getDay()); break
-    case 'last_30_days': start.setDate(now.getDate() - 30); break
-    case 'this_year': start.setMonth(0, 1); break
+    case 'today':
+      break
+    case 'this_week': {
+      const daysFromMonday = (now.getDay() + 6) % 7
+      start.setDate(start.getDate() - daysFromMonday)
+      break
+    }
+    case 'last_30_days':
+      // 30 days inclusive of today.
+      start.setDate(start.getDate() - 29)
+      break
+    case 'this_year':
+      start.setMonth(0, 1)
+      break
     case 'this_month':
-    default: start.setDate(1)
+    default:
+      start.setDate(1)
   }
 
-  const end = new Date(now)
-  end.setHours(23, 59, 59, 999)
-
-  return { gte: start, lte: end }
+  return { gte: start, lte: now }
 }
 
-/**
- * Midnight → 23:59:59.999 range for today only.
- */
+
 function todayRange() {
-  const start = new Date(); start.setHours(0, 0, 0, 0)
-  const end = new Date(); end.setHours(23, 59, 59, 999)
-  return { gte: start, lte: end }
+  const start = new Date()
+  start.setHours(0, 0, 0, 0)
+
+  const end = new Date(start)
+  end.setDate(end.getDate() + 1) 
+
+  return { gte: start, lt: end }
 }
 
-/**
- * Returns an array of Date objects (midnight) for the last N calendar days.
- * Useful for building chart data.
- *
- * @param {number} n
- * @returns {Date[]}
- */
+
 function lastNDays(n) {
   const days = []
   for (let i = n - 1; i >= 0; i--) {
@@ -66,12 +64,7 @@ function lastNDays(n) {
   return days
 }
 
-/**
- * Returns end-of-day (23:59:59.999) for a given midnight Date.
- *
- * @param {Date} dayMidnight
- * @returns {Date}
- */
+
 function endOfDay(dayMidnight) {
   const d = new Date(dayMidnight)
   d.setHours(23, 59, 59, 999)

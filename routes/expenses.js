@@ -27,7 +27,7 @@ router.post('/',
 
 router.put('/:id', 
   authenticate, 
-  authorize('admin', 'receptionist', 'pharmacist'), 
+  authorize('admin'), 
   validate({ params: schemas.idParamSchema, body: schemas.updateExpenseSchema }), 
   c.updateExpense
 )

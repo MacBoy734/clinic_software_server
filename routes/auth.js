@@ -15,11 +15,13 @@ router.post('/login', async (req, res) => {
 
   try {
     const user = await prisma.staff.findFirst({
-      where: { username, role, is_active: true }
+      where: { username, role },
     })
-
     if (!user) {
-      return res.status(400).json({ error: 'Invalid credentials' })
+      return res.status(403).json({ error: 'Wrong credentials' })
+    }
+    if (!user.is_active) {
+      return res.status(403).json({ error: 'Account deactivated. Contact admin!' })
     }
 
     const valid = await bcrypt.compare(password, user.password)

@@ -1,6 +1,6 @@
 const bcrypt = require('bcryptjs')
 const prisma = require('../lib/prisma')
-const { writeAuditLog, getPeriodRange, todayRange, lastNDays, endOfDay, dayLabel, buildDayBuckets, resolveRange, parseDateRange, getPagination} = require('../utils/helpers')
+const { writeAuditLog, getPeriodRange, todayRange, lastNDays, endOfDay, dayLabel, buildDayBuckets, resolveRange, parseDateRange, getPagination } = require('../utils/helpers')
 const { getSettings, invalidateSettings, SETTINGS_ID } = require('../lib/settings')
 
 
@@ -14,44 +14,6 @@ function getPeriodStart(period) {
   return d
 }
 
-function shapeExpense(e, domain) {
-  return {
-    id: e.id,
-    description: e.description,
-    amount: e.amount,
-    category: e.category ?? null,
-    domain,
-    incurred_at: e.incurred_at,
-    created_at: e.created_at,
-    recorder: e.recorded_by_staff ? { username: e.recorded_by_staff.username } : null,
-  }
-}
-
-
-const VISIT_INCLUDE = {
-  doctor: { select: { username: true } },
-  bill: true,
-  lab_requests: {
-    select: {
-      id: true,
-      status: true,
-      notes: true,
-      urgency: true,
-      requested_at: true,
-      completed_at: true,
-      items: {
-        select: { id: true, test_name: true, status: true, result: true, unit_cost: true },
-      },
-    },
-  },
-  prescriptions: {
-    include: {
-      items: {
-        select: { id: true, drug_name: true, dosage: true, frequency: true, duration: true, quantity: true, unit_cost: true }
-      }
-    }
-  },
-}
 
 function shapeReferral(r) {
   return {
@@ -70,21 +32,6 @@ function shapeReferral(r) {
   }
 }
 
-function flattenLabRequests(labRequests) {
-  return labRequests.flatMap(lr =>
-    lr.items.map(item => ({
-      id: item.id,
-      request_id: lr.id,
-      test_name: item.test_name,
-      status: item.status ?? lr.status,
-      result: item.result ?? null,
-      unit_cost: item.unit_cost ?? 0,
-      urgency: lr.urgency ?? null,
-      requested_at: lr.requested_at ?? null,
-      completed_at: lr.completed_at ?? null,
-    }))
-  )
-}
 
 module.exports.getAdminOverview = async (req, res) => {
   const today = new Date()
@@ -253,6 +200,207 @@ module.exports.getAdminOverview = async (req, res) => {
     return res.status(500).json({ error: 'Failed to load overview' })
   }
 }
+module.exports.getPharmacyFinanceOverview = async (req, res) => {
+  try {
+    const { from, to } = req.query
+
+    if (!from || !to) {
+      return res.status(400).json({ error: 'from and to are required (YYYY-MM-DD)' })
+    }
+
+    const start = new Date(from)
+    const end = new Date(to)
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+      return res.status(400).json({ error: 'Invalid date format' })
+    }
+    if (start > end) {
+      return res.status(400).json({ error: 'from must be before to' })
+    }
+
+    start.setHours(0, 0, 0, 0)
+    end.setHours(23, 59, 59, 999)
+
+    const range = { gte: start, lte: end }
+    const n = (v) => v ?? 0
+
+    const [paymentAgg, expenseAgg, discountAgg, creditExtended, creditCollected] = await prisma.$transaction([
+      // Revenue by payment method (uses OtcSalePayment for accuracy)
+      prisma.otcSalePayment.groupBy({
+        by: ['method'],
+        where: { created_at: range },
+        _sum: { amount: true },
+      }),
+      // Pharmacy expenses by category
+      prisma.pharmacyExpense.groupBy({
+        by: ['category'],
+        where: { incurred_at: range },
+        _sum: { amount: true },
+      }),
+      // Discounts given
+      prisma.otcSale.aggregate({
+        where: { sold_at: range },
+        _sum: { discount_amount: true },
+      }),
+      // Total credit ever extended up to end date
+      prisma.otcSalePayment.aggregate({
+        where: { method: 'credit', created_at: { lte: end } },
+        _sum: { amount: true },
+      }),
+      // Total collected from credit customers up to end date
+      prisma.customerPayment.aggregate({
+        where: { created_at: { lte: end } },
+        _sum: { amount: true },
+      }),
+    ])
+
+    const by_method = { cash: 0, mpesa: 0, insurance: 0, credit: 0, other: 0 }
+    let total_revenue = 0
+    for (const p of paymentAgg) {
+      by_method[p.method] = n(p._sum.amount)
+      total_revenue += n(p._sum.amount)
+    }
+
+    let total_expenses = 0
+    const by_category = {}
+    for (const e of expenseAgg) {
+      const cat = e.category?.trim() || 'uncategorized'
+      by_category[cat] = n(e._sum.amount)
+      total_expenses += n(e._sum.amount)
+    }
+
+    const total_credit = n(creditExtended._sum.amount)
+    const total_collected = n(creditCollected._sum.amount)
+    const outstanding_balance = Math.max(0, total_credit - total_collected)
+
+    const days_in_range = Math.max(1, Math.round((end - start) / 86400000))
+
+    return res.json({
+      revenue: {
+        total: total_revenue,
+        cash_sales: total_revenue - by_method.credit,
+        credit_sales: by_method.credit,
+        discounts: n(discountAgg._sum.discount_amount),
+      },
+      by_payment_method: by_method,
+      expenses: {
+        total: total_expenses,
+        by_category,
+      },
+      outstanding: {
+        total_credit,
+        total_collected,
+        balance: outstanding_balance,
+      },
+      days_in_range,
+      net: total_revenue - total_expenses,
+    })
+  } catch (err) {
+    console.error('Pharmacy finance overview error:', err.message)
+    return res.status(500).json({ error: 'Failed to load pharmacy finance overview' })
+  }
+}
+module.exports.getPharmacySales = async (req, res) => {
+  try {
+    const {
+      from,
+      to,
+      search,
+      payment_method,
+      page = '1',
+      limit = '20',
+    } = req.query
+
+    const start = from ? new Date(from) : new Date()
+    const end = to ? new Date(to) : new Date()
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+      return res.status(400).json({ error: 'Invalid date format' })
+    }
+    start.setHours(0, 0, 0, 0)
+    end.setHours(23, 59, 59, 999)
+
+    const pageNum = Math.max(1, parseInt(page))
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit)))
+    const skip = (pageNum - 1) * limitNum
+
+    const where = { sold_at: { gte: start, lte: end } }
+    if (payment_method && payment_method !== 'all') {
+      where.payment_method = payment_method
+    }
+    if (search?.trim()) {
+      const q = search.trim()
+      where.OR = [
+        { receipt_number: { contains: q, mode: 'insensitive' } },
+        { customer_name: { contains: q, mode: 'insensitive' } },
+      ]
+    }
+
+    const [sales, total] = await Promise.all([
+      prisma.otcSale.findMany({
+        where,
+        skip,
+        take: limitNum,
+        orderBy: { sold_at: 'desc' },
+        include: {
+          items: {
+            select: {
+              id: true,
+              name: true,
+              quantity: true,
+              unit_price: true,
+              unit_cost: true,
+              tax_amount: true,
+              price_tier: true,
+            },
+          },
+          payments: {
+            select: {
+              id: true,
+              method: true,
+              amount: true,
+              reference: true,
+              created_at: true,
+            },
+          },
+          customer: {
+            select: { id: true, name: true, phone: true },
+          },
+          sold_by_staff: {
+            select: { username: true },
+          },
+        },
+      }),
+      prisma.otcSale.count({ where }),
+    ])
+
+    const shaped = sales.map((s) => ({
+      id: s.id,
+      receipt_number: s.receipt_number,
+      customer_name: s.customer_name,
+      customer_id: s.customer_id,
+      subtotal: s.subtotal,
+      tax_total: s.tax_total,
+      total: s.total,
+      discount_amount: s.discount_amount,
+      discount_reason: s.discount_reason,
+      payment_method: s.payment_method,
+      sold_at: s.sold_at,
+      sold_by: s.sold_by_staff?.username ?? null,
+      items: s.items,
+      payments: s.payments,
+    }))
+
+    return res.json({
+      sales: shaped,
+      total,
+      page: pageNum,
+      limit: limitNum,
+      pages: Math.ceil(total / limitNum),
+    })
+  } catch (err) {
+    console.error('getPharmacySales error:', err.message)
+    return res.status(500).json({ error: 'Failed to fetch pharmacy sales' })
+  }
+}
 module.exports.getRevenueWeek = async (req, res) => {
   try {
     const days = lastNDays(7)
@@ -417,7 +565,7 @@ module.exports.getLabReport = async (req, res) => {
   try {
     const { start, end, days } = resolveRange(req.query)
     const where = { requested_at: { gte: start, lte: end } }
- 
+
     const [labRequests, items] = await Promise.all([
       prisma.labRequest.findMany({
         where,
@@ -428,9 +576,9 @@ module.exports.getLabReport = async (req, res) => {
         select: { test_name: true },
       }),
     ])
- 
+
     const total = labRequests.length
- 
+
     // ── by_day (grouped by LabRequest.requested_at) ────────────────────────
     const dayBuckets = buildDayBuckets(start, days)
     const bucketByKey = Object.fromEntries(dayBuckets.map((b) => [b.key, b]))
@@ -439,23 +587,23 @@ module.exports.getLabReport = async (req, res) => {
       if (bucketByKey[key]) bucketByKey[key].count++
     }
     const by_day = dayBuckets.map(({ day, count }) => ({ day, count }))
- 
+
     // ── avg_turnaround_hours (only requests completed within the range) ───
     const completed = labRequests.filter((lr) => lr.completed_at)
     const avg_turnaround_hours =
       completed.length > 0
         ? Math.round(
-            (completed.reduce(
-              (sum, lr) =>
-                sum + (new Date(lr.completed_at) - new Date(lr.requested_at)),
-              0
-            ) /
-              completed.length /
-              (1000 * 60 * 60)) *
-              10
-          ) / 10
+          (completed.reduce(
+            (sum, lr) =>
+              sum + (new Date(lr.completed_at) - new Date(lr.requested_at)),
+            0
+          ) /
+            completed.length /
+            (1000 * 60 * 60)) *
+          10
+        ) / 10
         : 0
- 
+
     // ── top_tests / most_ordered (grouped by LabRequestItem.test_name) ─────
     const testCounts = items.reduce((acc, item) => {
       acc[item.test_name] = (acc[item.test_name] || 0) + 1
@@ -466,7 +614,7 @@ module.exports.getLabReport = async (req, res) => {
       .sort((a, b) => b.count - a.count)
       .slice(0, 10)
     const most_ordered = top_tests[0]?.name ?? '—'
- 
+
     return res.json({
       stats: { total },
       by_day,
@@ -485,18 +633,9 @@ module.exports.getLabReport = async (req, res) => {
 
 module.exports.getAdminVisitsReport = async (req, res) => {
   try {
-    const DAYS = 7
-    const today = new Date()
-    today.setHours(0, 0, 0, 0)
- 
-    const start = new Date(today)
-    start.setDate(start.getDate() - (DAYS - 1)) 
- 
-    const end = new Date(today)
-    end.setHours(23, 59, 59, 999)
- 
+    const { start, end, days } = resolveRange(req.query)
     const where = { arrived_at: { gte: start, lte: end } }
- 
+
     const [visits, byTypeGroups] = await Promise.all([
       prisma.visit.findMany({
         where,
@@ -508,68 +647,51 @@ module.exports.getAdminVisitsReport = async (req, res) => {
         _count: { _all: true },
       }),
     ])
- 
+
     const total_visits = visits.length
- 
-    // ── by_visit_type ──────────────────────────────────────────────────────
     const by_visit_type = byTypeGroups.reduce((acc, g) => {
       acc[g.visit_type] = g._count._all
       return acc
     }, {})
- 
-    // ── most_common_type ───────────────────────────────────────────────────
+
     const most_common_type = byTypeGroups
       .slice()
       .sort((a, b) => b._count._all - a._count._all)[0]?.visit_type ?? '—'
- 
-    // ── by_day (fixed 7-day window, oldest -> newest) ──────────────────────
-    const dayBuckets = []
-    for (let i = 0; i < DAYS; i++) {
-      const d = new Date(start)
-      d.setDate(start.getDate() + i)
-      dayBuckets.push({
-        key: d.toDateString(),
-        day: d.toLocaleDateString('en-US', { weekday: 'short' }),
-        count: 0,
-      })
-    }
+
+    const dayBuckets = buildDayBuckets(start, days)
     const bucketByKey = Object.fromEntries(dayBuckets.map((b) => [b.key, b]))
     for (const v of visits) {
       const key = new Date(v.arrived_at).toDateString()
       if (bucketByKey[key]) bucketByKey[key].count++
     }
     const by_day = dayBuckets.map(({ day, count }) => ({ day, count }))
- 
-    // ── avg_per_day ─────────────────────────────────────────────────────────
-    const avg_per_day = Math.round(total_visits / DAYS)
- 
-    // ── completion_rate ──────────────────────────────────────────────────────
+
+    const avg_per_day = days > 0 ? Math.round(total_visits / days) : 0
+
     const completedCount = visits.filter(
-      (v) => v.status === 'done' || v.status === 'archived'
+      (v) => v.status === 'done' || v.status === 'archived' || v.status === 'partially_paid'
     ).length
     const completion_rate =
       total_visits > 0 ? Math.round((completedCount / total_visits) * 100) : 0
- 
+
     return res.json({
-      stats: {
-        total_visits,
-        avg_per_day,
-        most_common_type,
-        completion_rate,
-      },
+      stats: { total_visits, avg_per_day, most_common_type, completion_rate },
       by_day,
       by_visit_type,
     })
   } catch (err) {
-    console.error('[admin] getAdminStats:', err.message)
-    return res.status(500).json({ error: 'Failed to fetch admin stats' })
+    console.error('[admin] getAdminVisitsReport:', err.message)
+    if (err.message === 'Invalid custom date range') {
+      return res.status(400).json({ error: 'Invalid start/end date' })
+    }
+    return res.status(500).json({ error: 'Failed to fetch visit report' })
   }
 }
 
 module.exports.getPharmacyReport = async (req, res) => {
   try {
     const { start, end, days } = resolveRange(req.query)
- 
+
     const [dispensedPrescriptions, otcSales, expenseAgg] = await Promise.all([
       // "Dispensed" = the prescription itself was handed out to the patient
       prisma.prescription.findMany({
@@ -595,11 +717,11 @@ module.exports.getPharmacyReport = async (req, res) => {
         _sum: { amount: true },
       }),
     ])
- 
+
     const dispensed_total = dispensedPrescriptions.length
     const otc_total = otcSales.length
     const expenses_total = expenseAgg._sum.amount ?? 0
- 
+
     // ── by_day: dispensed (by Prescription.dispensed_at) + otc (by OtcSale.sold_at)
     const dayBuckets = buildDayBuckets(start, days).map((b) => ({
       ...b,
@@ -607,7 +729,7 @@ module.exports.getPharmacyReport = async (req, res) => {
       otc: 0,
     }))
     const bucketByKey = Object.fromEntries(dayBuckets.map((b) => [b.key, b]))
- 
+
     for (const rx of dispensedPrescriptions) {
       const key = new Date(rx.dispensed_at).toDateString()
       if (bucketByKey[key]) bucketByKey[key].dispensed++
@@ -621,10 +743,10 @@ module.exports.getPharmacyReport = async (req, res) => {
       dispensed,
       otc,
     }))
- 
+
     // ── top_drugs: merge quantities from issued prescription items + OTC sale items
     const drugCounts = {}
- 
+
     for (const rx of dispensedPrescriptions) {
       for (const item of rx.items) {
         if (item.status !== 'issued') continue // skip declined/returned/pending lines
@@ -637,12 +759,12 @@ module.exports.getPharmacyReport = async (req, res) => {
         drugCounts[item.name] = (drugCounts[item.name] || 0) + (item.quantity || 0)
       }
     }
- 
+
     const top_drugs = Object.entries(drugCounts)
       .map(([name, count]) => ({ name, count }))
       .sort((a, b) => b.count - a.count)
       .slice(0, 10)
- 
+
     return res.json({
       stats: { dispensed_total, otc_total, expenses_total },
       by_day,
@@ -914,10 +1036,11 @@ module.exports.getPatientDetail = async (req, res) => {
 
     const total_visits = patient.visits.length
     const total_billed = patient.visits.reduce((s, v) => s + num(v.bill?.total_amount), 0)
+    const total_discounts = patient.visits.reduce((s, v) => s + num(v.bill?.discount_amount), 0)
     const total_paid = patient.visits.reduce((s, v) => {
-      return s + (v.bill?.payments?.reduce((ps, p) => ps + num(p.amount), 0) || 0)
+      return s + (v.bill?.payments?.reduce((ps, p) => ps + num(p.amount), 0))
     }, 0)
-    const unpaid_balance = Math.max(0, total_billed - total_paid)
+    const unpaid_balance = Math.max(0, total_billed - total_paid - total_discounts)
 
     const visits = patient.visits.map(v => {
       const bill = v.bill
@@ -945,14 +1068,22 @@ module.exports.getPatientDetail = async (req, res) => {
           id: bill.id,
           consultation_fee: bill.consultation_fee,
           consultation_fee_status: bill.consultation_fee_status,
+          consultation_fee_waived_by: bill.consultation_fee_waived_by,
+          consultation_fee_waive_reason: bill.consultation_fee_waive_reason,
+          consultation_fee_waived_at: bill.consultation_fee_waived_at,
           lab_fee: bill.lab_fee,
           medication_fee: bill.medication_fee,
           procedure_fee: bill.procedure_fee,
           stage2_status: bill.stage2_status,
+          stage2_waived_by: bill.stage2_waived_by,
+          stage2_waive_reason: bill.stage2_waive_reason,
+          stage2_waived_at: bill.stage2_waived_at,
+          discount_amount: bill.discount_amount,
+          discount_reason: bill.discount_reason,
           total_amount: bill.total_amount,
           fee_status: bill.fee_status,
           paid_amount,
-          balance: Math.max(0, bill.total_amount - paid_amount),
+          balance: Math.max(0, bill.total_amount - paid_amount - (bill.discount_amount || 0)),
           payments: bill.payments || [],
         } : null,
         lab_requests: v.lab_requests || [],
@@ -985,7 +1116,7 @@ module.exports.getPatientDetail = async (req, res) => {
       visits,
     })
   } catch (err) {
-    console.error('getPatientDetail error:', err)
+    console.error('getPatientDetail error:', err.message)
     return res.status(500).json({ error: 'Failed to fetch patient details' })
   }
 }
@@ -1147,44 +1278,52 @@ module.exports.getBillingQueueToday = async (req, res) => {
   }
 }
 
+
 module.exports.getBills = async (req, res) => {
   try {
     const {
-      period = 'this_month',
-      status,        // 'paid' | 'pending' | 'waived'
-      visit_type,    // 'consultation' | 'injection' | 'family_planning' | 'direct_lab'
-      search,        // patient name substring
+      from,
+      to,
+      status,        
+      visit_type,
+      search,
       page = '1',
-      limit = '50',
+      limit = '20',
     } = req.query
 
-    const range = getPeriodRange(period)
-    const skip = (parseInt(page) - 1) * parseInt(limit)
-
-    const where = {
-      created_at: range,
+    if (!from || !to) {
+      return res.status(400).json({ error: 'from and to dates are required' })
     }
 
-    if (status && status !== 'all') {
+    const { fromDate, toDate } = parseDateRange(from, to)
+
+    const pageNum = Math.max(1, parseInt(page) || 1)
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit) || 20))
+    const skip = (pageNum - 1) * limitNum
+
+    // One nested `visit` object — assigning it twice drops the first constraint.
+    const visitWhere = { status: { in: ['billing', 'done', 'archived', 'partially_paid'] } }
+    if (visit_type && visit_type !== 'all') visitWhere.visit_type = visit_type
+    if (search?.trim()) {
+      visitWhere.patient = { name: { contains: search.trim(), mode: 'insensitive' } }
+    }
+
+    const where = {
+      created_at: { gte: fromDate, lte: toDate },
+      visit: visitWhere,
+    }
+
+    // 'partial' is derived, not stored, so it can't be a database filter.
+    // Everything else maps straight onto fee_status.
+    if (status && status !== 'all' && status !== 'partial') {
       where.fee_status = status
     }
 
-    if (visit_type && visit_type !== 'all') {
-      where.visit = { visit_type }
-    }
-
-    if (search) {
-      where.visit = {
-        ...where.visit,
-        patient: { name: { contains: search, mode: 'insensitive' } },
-      }
-    }
-
-    const [bills, total] = await Promise.all([
+    const [rows, total] = await Promise.all([
       prisma.bill.findMany({
         where,
         skip,
-        take: parseInt(limit),
+        take: limitNum,
         orderBy: { created_at: 'desc' },
         include: {
           visit: {
@@ -1193,28 +1332,34 @@ module.exports.getBills = async (req, res) => {
               visit_type: true,
               status: true,
               arrived_at: true,
-              patient: {
-                select: { id: true, name: true, phone: true, gender: true },
-              },
-              doctor: {
-                select: { username: true },
-              },
+              patient: { select: { id: true, name: true, phone: true, gender: true } },
+              doctor: { select: { username: true } },
             },
           },
           payments: {
-            select: {
-              id: true, amount: true, method: true, reference: true, stage: true, paid_at: true,
-              cashier: { select: { username: true } }
-            },
             orderBy: { paid_at: 'asc' },
+            select: {
+              id: true, amount: true, method: true, reference: true,
+              stage: true, paid_at: true,
+              cashier: { select: { username: true } },
+            },
           },
         },
       }),
       prisma.bill.count({ where }),
     ])
 
-    const shaped = bills.map(b => {
+    const shaped = rows.map((b) => {
+      const billed =
+        b.consultation_fee + b.lab_fee + b.medication_fee + b.procedure_fee
       const paid_amount = b.payments.reduce((s, p) => s + p.amount, 0)
+      const outstanding_amount = Math.max(0, billed - paid_amount - b.discount_amount)
+
+      // Display only. fee_status stays a closed/open flag in the database.
+      const display_status =
+        outstanding_amount === 0 ? b.fee_status
+          : paid_amount > 0 ? 'partial'
+            : 'pending'
 
       const items = [
         b.consultation_fee > 0 && { name: 'Consultation', amount: b.consultation_fee, status: b.consultation_fee_status },
@@ -1226,7 +1371,7 @@ module.exports.getBills = async (req, res) => {
       return {
         id: b.id,
         visit_id: b.visit_id,
-        patient_id: b.visit?.patient?.id,
+        patient_id: b.visit?.patient?.id ?? null,
         patient_name: b.visit?.patient?.name ?? '—',
         patient_phone: b.visit?.patient?.phone ?? null,
         patient_gender: b.visit?.patient?.gender ?? null,
@@ -1234,19 +1379,24 @@ module.exports.getBills = async (req, res) => {
         visit_type: b.visit?.visit_type ?? null,
         visit_status: b.visit?.status ?? null,
         arrived_at: b.visit?.arrived_at ?? null,
+
         consultation_fee: b.consultation_fee,
         consultation_fee_status: b.consultation_fee_status,
         lab_fee: b.lab_fee,
         medication_fee: b.medication_fee,
         procedure_fee: b.procedure_fee,
         stage2_status: b.stage2_status,
-        total_amount: b.total_amount,
-        fee_status: b.fee_status,
-        status: b.fee_status,
+
+        total_amount: billed,
         paid_amount,
-        balance: Math.max(0, b.total_amount - paid_amount),
+        discount_amount: b.discount_amount,
+        discount_reason: b.discount_reason ?? null,
+        outstanding_amount,
+        fee_status: b.fee_status,
+        status: display_status,
+
         items,
-        payments: b.payments.map(p => ({
+        payments: b.payments.map((p) => ({
           id: p.id,
           amount: p.amount,
           method: p.method,
@@ -1260,31 +1410,70 @@ module.exports.getBills = async (req, res) => {
       }
     })
 
-    const all = await prisma.bill.findMany({
-      where,
-      select: {
-        total_amount: true, fee_status: true,
-        payments: { select: { amount: true } },
-      },
-    })
+    // Filtered in memory because 'partial' has no column. Applied after the
+    // page is fetched, so `total` still reflects the unfiltered set — the
+    // page may come back short. Acceptable for a display-only filter.
+    const bills =
+      status === 'partial'
+        ? shaped.filter((b) => b.status === 'partial')
+        : shaped
 
-    const summary = all.reduce((acc, b) => {
-      const paid = b.payments.reduce((s, p) => s + p.amount, 0)
-      acc.total_billed += b.total_amount
-      acc.total_collected += paid
-      acc.total_pending += Math.max(0, b.total_amount - paid)
-      if (b.fee_status === 'paid') acc.paid_count++
-      if (b.fee_status === 'pending') acc.pending_count++
-      if (b.fee_status === 'waived') { acc.total_waived += b.total_amount; acc.waived_count++ }
-      return acc
-    }, { total_billed: 0, total_collected: 0, total_pending: 0, total_waived: 0, paid_count: 0, pending_count: 0, waived_count: 0 })
+    // Summary covers the whole filtered set, not the page. Aggregates rather
+    // than a third findMany over every matching bill.
+    const [feeAgg, paidAgg, waivedAgg, statusCounts] = await Promise.all([
+      prisma.bill.aggregate({
+        where,
+        _sum: {
+          consultation_fee: true, lab_fee: true,
+          medication_fee: true, procedure_fee: true,
+          discount_amount: true,
+        },
+      }),
+      prisma.payment.aggregate({
+        where: { bill: where },
+        _sum: { amount: true },
+      }),
+      prisma.bill.aggregate({
+        where: { ...where, fee_status: 'waived' },
+        _sum: { discount_amount: true },
+        _count: true,
+      }),
+      prisma.bill.groupBy({
+        by: ['fee_status'],
+        where,
+        _count: { _all: true },
+      }),
+    ])
+
+    const n = (v) => v ?? 0
+    const total_billed =
+      n(feeAgg._sum.consultation_fee) + n(feeAgg._sum.lab_fee) +
+      n(feeAgg._sum.medication_fee) + n(feeAgg._sum.procedure_fee)
+    const total_collected = n(paidAgg._sum.amount)
+    const total_discount = n(feeAgg._sum.discount_amount)
+
+    const counts = Object.fromEntries(
+      statusCounts.map((g) => [g.fee_status, g._count._all])
+    )
 
     return res.json({
-      bills: shaped,
+      bills,
       total,
-      page: parseInt(page),
-      limit: parseInt(limit),
-      summary,
+      page: pageNum,
+      limit: limitNum,
+      pages: Math.max(1, Math.ceil(total / limitNum)),
+      summary: {
+        total_billed,
+        total_collected,
+        total_discount,
+        // Set-wide residual. Individual overpayments aren't clamped away here,
+        // so this can differ slightly from the sum of per-bill balances.
+        total_outstanding: Math.max(0, total_billed - total_collected - total_discount),
+        total_waived: n(waivedAgg._sum.discount_amount),
+        paid_count: counts.paid ?? 0,
+        pending_count: counts.pending ?? 0,
+        waived_count: waivedAgg._count ?? 0,
+      },
     })
   } catch (err) {
     console.error('[admin] getBills:', err.message)
@@ -1626,298 +1815,6 @@ module.exports.deleteLabStockItem = async (req, res) => {
 }
 
 
-// module.exports.getExpenses = async (req, res) => {
-//   try {
-//     const { domain = 'clinic', period = 'this_month', category } = req.query
-//     const range = getPeriodRange(period)
-
-//     const model = domain === 'pharmacy' ? prisma.pharmacyExpense : prisma.clinicExpense
-//     const where = { incurred_at: range }
-//     if (category && category !== 'all') where.category = category
-
-//     const expenses = await model.findMany({
-//       where,
-//       orderBy: { incurred_at: 'desc' },
-//       include: { recorded_by_staff: { select: { username: true } } },
-//     })
-
-//     return res.json({
-//       expenses: expenses.map(e => shapeExpense(e, domain)),
-//       stats: { total: expenses.reduce((s, e) => s + e.amount, 0) },
-//     })
-//   } catch (err) {
-//     console.error('[admin] getExpenses:', err.message)
-//     return res.status(500).json({ error: 'Failed to fetch expenses' })
-//   }
-// }
-module.exports.getExpenses = async (req, res) =>{
-  try {
-    const { from, to, department } = req.query
-    if (!from || !to) {
-      return res.status(400).json({ error: 'from and to dates are required' })
-    }
-    const { fromDate, toDate } = parseDateRange(from, to)
-    const { page, limit, offset } = getPagination(req)
-    const { start: todayStart, end: todayEnd } = todayRange()
-
-    if (!department) {
-      const [
-        clinicItems,
-        pharmacyItems,
-        clinicSum,
-        pharmacySum,
-        clinicToday,
-        pharmacyToday,
-        clinicTodayCount,
-        pharmacyTodayCount,
-        clinicByCat,
-        pharmacyByCat,
-      ] = await Promise.all([
-        prisma.clinicExpense.findMany({
-          where: { incurred_at: { gte: fromDate, lte: toDate } },
-          include: { recorded_by_staff: { select: { name: true } } },
-          orderBy: { incurred_at: 'desc' },
-        }),
-        prisma.pharmacyExpense.findMany({
-          where: { incurred_at: { gte: fromDate, lte: toDate } },
-          include: { recorded_by_staff: { select: { name: true } } },
-          orderBy: { incurred_at: 'desc' },
-        }),
-        prisma.clinicExpense.aggregate({
-          where: { incurred_at: { gte: fromDate, lte: toDate } },
-          _sum: { amount: true },
-        }),
-        prisma.pharmacyExpense.aggregate({
-          where: { incurred_at: { gte: fromDate, lte: toDate } },
-          _sum: { amount: true },
-        }),
-        prisma.clinicExpense.aggregate({
-          where: { incurred_at: { gte: todayStart, lte: todayEnd } },
-          _sum: { amount: true },
-        }),
-        prisma.pharmacyExpense.aggregate({
-          where: { incurred_at: { gte: todayStart, lte: todayEnd } },
-          _sum: { amount: true },
-        }),
-        prisma.clinicExpense.count({
-          where: { incurred_at: { gte: todayStart, lte: todayEnd } },
-        }),
-        prisma.pharmacyExpense.count({
-          where: { incurred_at: { gte: todayStart, lte: todayEnd } },
-        }),
-        prisma.clinicExpense.groupBy({
-          by: ['category'],
-          where: { incurred_at: { gte: fromDate, lte: toDate } },
-          _sum: { amount: true },
-        }),
-        prisma.pharmacyExpense.groupBy({
-          by: ['category'],
-          where: { incurred_at: { gte: fromDate, lte: toDate } },
-          _sum: { amount: true },
-        }),
-      ])
-
-      const all = [
-        ...clinicItems.map((e) => ({ ...e, department: 'reception' })),
-        ...pharmacyItems.map((e) => ({ ...e, department: 'pharmacy' })),
-      ].sort((a, b) => new Date(b.incurred_at) - new Date(a.incurred_at))
-
-      const total = all.length
-      const expenses = all.slice(offset, offset + limit)
-
-      const byCategory = {}
-      for (const g of [...clinicByCat, ...pharmacyByCat]) {
-        const key = g.category || 'uncategorized'
-        byCategory[key] = (byCategory[key] || 0) + (g._sum.amount || 0)
-      }
-
-      res.json({
-        expenses: expenses.map((e) => ({
-          id: e.id,
-          description: e.description,
-          amount: e.amount,
-          category: e.category,
-          recorded_by: e.recorded_by_staff?.name || 'Unknown',
-          recorded_at: e.incurred_at,
-          department: e.department,
-        })),
-        stats: {
-          total: (clinicSum._sum.amount || 0) + (pharmacySum._sum.amount || 0),
-          today_total: (clinicToday._sum.amount || 0) + (pharmacyToday._sum.amount || 0),
-          today_count: clinicTodayCount + pharmacyTodayCount,
-          by_department: {
-            reception: clinicSum._sum.amount || 0,
-            pharmacy: pharmacySum._sum.amount || 0,
-          },
-          by_category: byCategory,
-        },
-        page,
-        pages: Math.max(1, Math.ceil(total / limit)),
-        total,
-      })
-    } else {
-      const model = department === 'pharmacy' ? prisma.pharmacyExpense : prisma.clinicExpense
-      const where = { incurred_at: { gte: fromDate, lte: toDate } }
-
-      const [items, count, totalSum, todaySum, todayCount, categoryGroups] = await Promise.all([
-        model.findMany({
-          where,
-          include: { recorded_by_staff: { select: { name: true } } },
-          orderBy: { incurred_at: 'desc' },
-          skip: offset,
-          take: limit,
-        }),
-        model.count({ where }),
-        model.aggregate({ where, _sum: { amount: true } }),
-        model.aggregate({
-          where: { ...where, incurred_at: { gte: todayStart, lte: todayEnd } },
-          _sum: { amount: true },
-        }),
-        model.count({
-          where: { ...where, incurred_at: { gte: todayStart, lte: todayEnd } },
-        }),
-        model.groupBy({
-          by: ['category'],
-          where,
-          _sum: { amount: true },
-        }),
-      ])
-
-      const byCategory = Object.fromEntries(
-        categoryGroups.map((g) => [g.category || 'uncategorized', g._sum.amount || 0])
-      )
-
-      res.json({
-        expenses: items.map((e) => ({
-          id: e.id,
-          description: e.description,
-          amount: e.amount,
-          category: e.category,
-          recorded_by: e.recorded_by_staff?.name || 'Unknown',
-          recorded_at: e.incurred_at,
-        })),
-        stats: {
-          total: totalSum._sum.amount || 0,
-          today_total: todaySum._sum.amount || 0,
-          today_count: todayCount,
-          by_category: byCategory,
-        },
-        page,
-        pages: Math.max(1, Math.ceil(count / limit)),
-        total: count,
-      })
-    }
-  } catch (err) {
-    console.error('Get expenses error:', err)
-    res.status(500).json({ error: 'Failed to load expenses' })
-  }
-}
-
-module.exports.getExpenseStats = async (req, res) => {
-  try {
-    const { domain = 'clinic', period = 'this_month' } = req.query
-    const range = getPeriodRange(period)
-
-    const model = domain === 'pharmacy' ? prisma.pharmacyExpense : prisma.clinicExpense
-
-    const [allTime, inPeriod, today] = await Promise.all([
-      model.aggregate({ _sum: { amount: true }, _count: true }),
-      model.aggregate({ where: { incurred_at: range }, _sum: { amount: true }, _count: true }),
-      model.aggregate({
-        where: {
-          incurred_at: {
-            gte: (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d })(),
-            lte: (() => { const d = new Date(); d.setHours(23, 59, 59, 999); return d })(),
-          },
-        },
-        _sum: { amount: true },
-        _count: true,
-      }),
-    ])
-
-    const rows = await model.findMany({
-      where: { incurred_at: range },
-      select: { amount: true, category: true },
-    })
-
-    const by_category = {}
-    rows.forEach(r => {
-      const cat = r.category || 'uncategorised'
-      by_category[cat] = (by_category[cat] || 0) + r.amount
-    })
-
-    return res.json({
-      total_amount: allTime._sum.amount ?? 0,
-      total_amount_period: inPeriod._sum.amount ?? 0,
-      entry_count: allTime._count ?? 0,
-      entry_count_period: inPeriod._count ?? 0,
-      today_amount: today._sum.amount ?? 0,
-      today_count: today._count ?? 0,
-      by_category,
-    })
-  } catch (err) {
-    console.error('[admin] getExpenseStats:', err.message)
-    return res.status(500).json({ error: 'Failed to fetch expense stats' })
-  }
-}
-
-module.exports.createExpense = async (req, res) => {
-  try {
-    const { domain = 'clinic', description, amount, category, incurred_at } = req.body
-    const staffId = req.user?.id ?? null
-
-    if (!description?.trim()) {
-      return res.status(400).json({ error: 'Description is required.' })
-    }
-    const parsedAmount = parseFloat(amount)
-    if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
-      return res.status(400).json({ error: 'Amount must be a positive number.' })
-    }
-
-    const date = incurred_at ? new Date(incurred_at) : new Date()
-    const model = domain === 'pharmacy' ? prisma.pharmacyExpense : prisma.clinicExpense
-
-    const expense = await model.create({
-      data: {
-        description: description.trim(),
-        amount: Math.round(parsedAmount),
-        category: category?.trim() || null,
-        recorded_by: staffId,
-        incurred_at: date,
-        created_at: new Date(),
-      },
-      include: { recorded_by_staff: { select: { username: true } } },
-    })
-
-    return res.status(201).json({ success: true, expense: shapeExpense(expense, domain) })
-  } catch (err) {
-    console.error('[admin] createExpense:', err.message)
-    return res.status(500).json({ error: 'Failed to record expense' })
-  }
-}
-
-module.exports.deleteExpense = async (req, res) => {
-  try {
-    const id = parseInt(req.params.id)
-    const domain = req.query.domain || 'clinic'
-
-    if (!id || isNaN(id)) {
-      return res.status(400).json({ error: 'Invalid expense ID.' })
-    }
-
-    const model = domain === 'pharmacy' ? prisma.pharmacyExpense : prisma.clinicExpense
-    const existing = await model.findUnique({ where: { id } })
-    if (!existing) return res.status(404).json({ error: 'Expense not found.' })
-
-    await model.delete({ where: { id } })
-
-    return res.json({ success: true })
-  } catch (err) {
-    console.error('[admin] deleteExpense:', err.message)
-    return res.status(500).json({ error: 'Failed to delete expense' })
-  }
-}
-
 module.exports.getSettings = async (req, res) => {
   try {
     const s = await getSettings()
@@ -2148,6 +2045,100 @@ module.exports.getDrugStock = async (req, res) => {
   }
 }
 
+exports.getProductDetail = async (req, res) => {
+  try {
+    const id = req.params.id
+
+    const product = await prisma.product.findUnique({
+      where: { id },
+      include: {
+        batches: {
+          orderBy: [{ is_exhausted: 'asc' }, { received_at: 'desc' }],
+        },
+        _count: {
+          select: { movements: true },
+        },
+      },
+    })
+
+    if (!product) {
+      return res.status(404).json({ error: 'Product not found' })
+    }
+
+    res.json({
+      product,
+      batches: product.batches,
+      stats: {
+        total_movements: product._count.movements,
+      },
+    })
+  } catch (err) {
+    console.error('getProductDetail', err)
+    res.status(500).json({ error: 'Failed to fetch product details' })
+  }
+}
+
+// ─── GET /api/admin/products/:id/movements ───────────────────────────────────
+
+exports.getProductMovements = async (req, res) => {
+  try {
+    const id = req.params.id
+    const {
+      reason,
+      batch_id,
+      from,
+      to,
+      page = '1',
+      limit = '25',
+    } = req.query
+
+    const pageNum = Math.max(1, parseInt(page) || 1)
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit) || 25))
+    const skip = (pageNum - 1) * limitNum
+
+    const where = { product_id: id }
+
+    if (reason) {
+      where.reason = reason
+    }
+
+    if (batch_id) {
+      const bid = parseInt(batch_id)
+      if (!isNaN(bid)) where.batch_id = bid
+    }
+
+    if (from || to) {
+      const range = {}
+      if (from) range.gte = new Date(from)
+      if (to) {
+        const end = new Date(to)
+        end.setDate(end.getDate() + 1)
+        range.lt = end
+      }
+      where.created_at = range
+    }
+
+    const [movements, total] = await Promise.all([
+      prisma.stockMovement.findMany({
+        where,
+        include: {
+          batch: { select: { batch_number: true } },
+          staff: { select: { username: true } },
+        },
+        orderBy: { created_at: 'desc' },
+        skip,
+        take: limitNum,
+      }),
+      prisma.stockMovement.count({ where }),
+    ])
+
+    res.json({ movements, total })
+  } catch (err) {
+    console.error('getProductMovements', err)
+    res.status(500).json({ error: 'Failed to fetch stock movements' })
+  }
+}
+
 
 module.exports.createDrugStockItem = async (req, res) => {
   const {
@@ -2372,14 +2363,14 @@ module.exports.createChargeTemplate = async (req, res) => {
     const template = await prisma.chargeTemplate.create({
       data: { name: name.trim(), category, amount: Math.round(amt), is_active: is_active !== false },
     })
-     await writeAuditLog({
+    await writeAuditLog({
       staffId: currentUser.id,
       user: currentUser.username,
       action: 'charge template created',
       description: `created charge template with id ${template.id})`,
       category: 'charge_template',
       entity: 'charge template',
-      entityId: id,
+      entityId: template.id,
       ipAddress: req.ip ?? req.headers['x-forwarded-for'] ?? null,
     })
     return res.status(201).json({ message: 'Template added', template })
@@ -2420,7 +2411,7 @@ module.exports.updateChargeTemplate = async (req, res) => {
     if (Object.keys(data).length === 0) return res.status(400).json({ error: 'No fields to update' })
 
     const template = await prisma.chargeTemplate.update({ where: { id: Number(id) }, data })
-     await writeAuditLog({
+    await writeAuditLog({
       staffId: currentUser.id,
       user: currentUser.username,
       action: 'charge template updated',
@@ -2844,7 +2835,7 @@ module.exports.payReferral = async (req, res) => {
         },
       },
     })
-     await writeAuditLog({
+    await writeAuditLog({
       staffId: currentUser.id,
       user: currentUser.username,
       action: 'commission paid',
@@ -2867,99 +2858,150 @@ module.exports.payReferral = async (req, res) => {
 module.exports.getFinanceOverview = async (req, res) => {
   try {
     const { from, to } = req.query
+
     if (!from || !to) {
-      return res.status(400).json({ error: 'from and to dates are required' })
-    }
-    const { fromDate, toDate } = parseDateRange(from, to)
-
-    const [
-      paymentAgg,
-      billAgg,
-      clinicExpSum,
-      pharmacyExpSum,
-      clinicExpByCat,
-      pharmacyExpByCat,
-    ] = await Promise.all([
-      prisma.payment.groupBy({
-        by: ['method'],
-        where: { paid_at: { gte: fromDate, lte: toDate } },
-        _sum: { amount: true },
-      }),
-      prisma.bill.aggregate({
-        where: { created_at: { gte: fromDate, lte: toDate } },
-        _sum: {
-          consultation_fee: true,
-          lab_fee: true,
-          medication_fee: true,
-          procedure_fee: true,
-        },
-      }),
-      prisma.clinicExpense.aggregate({
-        where: { incurred_at: { gte: fromDate, lte: toDate } },
-        _sum: { amount: true },
-      }),
-      prisma.pharmacyExpense.aggregate({
-        where: { incurred_at: { gte: fromDate, lte: toDate } },
-        _sum: { amount: true },
-      }),
-      prisma.clinicExpense.groupBy({
-        by: ['category'],
-        where: { incurred_at: { gte: fromDate, lte: toDate } },
-        _sum: { amount: true },
-      }),
-      prisma.pharmacyExpense.groupBy({
-        by: ['category'],
-        where: { incurred_at: { gte: fromDate, lte: toDate } },
-        _sum: { amount: true },
-      }),
-    ])
-
-    const byPaymentMethod = { cash: 0, mpesa: 0, insurance: 0, other: 0 }
-    let totalRevenue = 0
-    for (const p of paymentAgg) {
-      const amt = p._sum.amount || 0
-      totalRevenue += amt
-      if (byPaymentMethod.hasOwnProperty(p.method)) {
-        byPaymentMethod[p.method] += amt
-      } else {
-        byPaymentMethod.other += amt
-      }
+      return res.status(400).json({ error: 'from and to are required (YYYY-MM-DD)' })
     }
 
-    const clinicTotal = clinicExpSum._sum.amount || 0
-    const pharmacyTotal = pharmacyExpSum._sum.amount || 0
-    const totalExpenses = clinicTotal + pharmacyTotal
+    const start = new Date(from)
+    const end = new Date(to)
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+      return res.status(400).json({ error: 'Invalid date format' })
+    }
+    if (start > end) {
+      return res.status(400).json({ error: 'from must be before to' })
+    }
+
+    start.setHours(0, 0, 0, 0)
+    end.setHours(0, 0, 0, 0)
+    end.setDate(end.getDate() + 1) // exclusive upper bound
+
+    const range = { gte: start, lt: end }
+    const n = (v) => v ?? 0
+
+    const FINISHED = ['partially_paid', 'done', 'archived']
+
+    const [byMethod, collected, billedAgg, clinicExp, referralsTotal, clinicCat, openBills] =
+      await prisma.$transaction([
+        // ── Cash collected in range, split by method ──
+        prisma.payment.groupBy({
+          by: ['method'],
+          where: { paid_at: range },
+          _sum: { amount: true },
+        }),
+
+        // ── Cash collected in range, total. This is revenue. ──
+        prisma.payment.aggregate({
+          where: { paid_at: range },
+          _sum: { amount: true },
+        }),
+
+        // ── Accrued: what was charged in range, for visits that reached billing ──
+        prisma.bill.aggregate({
+          where: { created_at: range, visit: { status: { in: FINISHED } } },
+          _sum: {
+            consultation_fee: true,
+            lab_fee: true,
+            medication_fee: true,
+            procedure_fee: true,
+            discount_amount: true,
+          },
+        }),
+
+        prisma.clinicExpense.aggregate({
+          where: { incurred_at: range },
+          _sum: { amount: true },
+        }),
+
+        prisma.referral.aggregate({
+          where: { status: 'paid', paid_at: range },
+          _sum: { commission_amount: true },
+        }),
+
+        prisma.clinicExpense.groupBy({
+          by: ['category'],
+          where: { incurred_at: range },
+          _sum: { amount: true },
+        }),
+
+        // ── Outstanding as of range end. A balance, not a flow:
+        //    every finished bill up to `end`, regardless of when it was paid. ──
+        prisma.bill.findMany({
+          where: { created_at: { lt: end }, visit: { status: { in: FINISHED } } },
+          select: {
+            consultation_fee: true,
+            lab_fee: true,
+            medication_fee: true,
+            procedure_fee: true,
+            discount_amount: true,
+            payments: { select: { amount: true } },
+          },
+        }),
+      ])
+
+    // ── Revenue: cash that actually arrived. Partials included by construction. ──
+    const totalRevenue = n(collected._sum.amount)
+
+    const byPaymentMethod = { cash: 0, mpesa: 0, insurance: 0, credit: 0, other: 0 }
+    for (const p of byMethod) byPaymentMethod[p.method] = n(p._sum.amount)
+
+    // ── Billed: derived from the fee columns, not Bill.total_amount,
+    //    which no code path reliably maintains. ──
+    const consultation = n(billedAgg._sum.consultation_fee)
+    const lab = n(billedAgg._sum.lab_fee)
+    const medication = n(billedAgg._sum.medication_fee)
+    const procedures = n(billedAgg._sum.procedure_fee)
+    const totalDiscount = n(billedAgg._sum.discount_amount)
+    const totalBilled = consultation + lab + medication + procedures
+
+    // ── Credit: per-bill so an overpayment can't offset another patient's debt ──
+    let totalCredit = 0
+    for (const b of openBills) {
+      const billed =
+        b.consultation_fee + b.lab_fee + b.medication_fee + b.procedure_fee
+      const paid = b.payments.reduce((s, p) => s + p.amount, 0)
+      totalCredit += Math.max(0, billed - b.discount_amount - paid)
+    }
+
+    const clinicTotal = n(clinicExp._sum.amount)
+    const referrals = n(referralsTotal._sum.commission_amount)
+    const totalExpenses = clinicTotal + referrals
 
     const byCategory = {}
-    for (const g of [...clinicExpByCat, ...pharmacyExpByCat]) {
-      const key = g.category || 'uncategorized'
-      byCategory[key] = (byCategory[key] || 0) + (g._sum.amount || 0)
+    for (const r of clinicCat) {
+      const key = r.category?.trim() || 'uncategorized'
+      byCategory[key] = (byCategory[key] || 0) + n(r._sum.amount)
     }
 
-    const daysInRange = Math.max(1, Math.round((toDate - fromDate) / (1000 * 60 * 60 * 24)))
+    const daysInRange = Math.round((end - start) / 86400000)
 
-    res.json({
+    return res.json({
       revenue: {
         total: totalRevenue,
-        consultation: billAgg._sum.consultation_fee || 0,
-        procedures: billAgg._sum.procedure_fee || 0,
-        lab: billAgg._sum.lab_fee || 0,
-        medication: billAgg._sum.medication_fee || 0,
+      },
+      billed: {
+        total: totalBilled,
+        consultation,
+        lab,
+        medication,
+        procedures,
+        discounts: totalDiscount,
+      },
+      outstanding: {
+        total: totalCredit,
+        as_of: new Date(end.getTime() - 1),
       },
       by_payment_method: byPaymentMethod,
       expenses: {
         total: totalExpenses,
-        by_department: {
-          reception: clinicTotal,
-          pharmacy: pharmacyTotal,
-        },
+        by_department: { reception: clinicTotal, referrals },
         by_category: byCategory,
       },
       days_in_range: daysInRange,
       net: totalRevenue - totalExpenses,
     })
   } catch (err) {
-    console.error('Finance overview error:', err)
+    console.error('Finance overview error:', err.message)
     res.status(500).json({ error: 'Failed to load finance overview' })
   }
 }
@@ -2969,336 +3011,251 @@ module.exports.getFinanceOverview = async (req, res) => {
 // GET /api/admin/outstanding-balances
 module.exports.getOutstandingBalances = async (req, res) => {
   try {
-    const { from, to } = req.query
+    const { from, to, source } = req.query
+
+    if (source === 'pharmacy') {
+      return res.status(400).json({
+        error: 'Pharmacy credit is served by /api/admin/pharmacy/debt-book',
+      })
+    }
+
     if (!from || !to) {
       return res.status(400).json({ error: 'from and to dates are required' })
     }
+
     const { fromDate, toDate } = parseDateRange(from, to)
     const { page, limit, offset } = getPagination(req)
 
-    // ── Clinic: bills created in period that still have a balance ──
-    const clinicRows = await prisma.$queryRaw`
-      SELECT 
-        'clinic' as source,
-        b.visit_id as entity_id,
-        p.id AS patient_id,
-        p.name AS patient_name,
-        p.phone AS patient_phone,
-        b.total_amount AS total_bill,
-        COALESCE(SUM(py.amount), 0)::int AS paid_amount,
-        b.discount_amount AS waived_amount,
-        (b.total_amount - COALESCE(SUM(py.amount), 0) - b.discount_amount)::int AS balance,
-        v.arrived_at as created_at
-      FROM bills b
-      JOIN visits v ON v.id = b.visit_id
-      JOIN patients p ON p.id = v.patient_id
-      LEFT JOIN payments py ON py.bill_id = b.id
-      WHERE b.created_at >= ${fromDate} AND b.created_at <= ${toDate}
-      GROUP BY b.id, v.id, p.id, p.name, p.phone, b.total_amount, b.discount_amount, v.arrived_at
-      HAVING b.total_amount - COALESCE(SUM(py.amount), 0) - b.discount_amount > 0
-      ORDER BY balance DESC
+    // Window functions carry the set-wide count and total alongside the page,
+    // so the caller gets accurate totals without a second pass over the data.
+    const rows = await prisma.$queryRaw`
+      WITH bill_balances AS (
+        SELECT
+          b.visit_id,
+          p.id    AS patient_id,
+          p.name  AS patient_name,
+          p.phone AS patient_phone,
+          (b.consultation_fee + b.lab_fee + b.medication_fee + b.procedure_fee)::int AS total_bill,
+          COALESCE(SUM(py.amount), 0)::int AS paid_amount,
+          b.discount_amount::int AS waived_amount,
+          v.arrived_at AS created_at
+        FROM bills b
+        JOIN visits v   ON v.id = b.visit_id
+        JOIN patients p ON p.id = v.patient_id
+        LEFT JOIN payments py ON py.bill_id = b.id
+        WHERE b.created_at >= ${fromDate}
+          AND b.created_at <= ${toDate}
+          AND v.status IN ('done', 'archived', 'partially_paid')
+        GROUP BY
+          b.id, b.visit_id, b.consultation_fee, b.lab_fee,
+          b.medication_fee, b.procedure_fee, b.discount_amount,
+          v.id, v.arrived_at, p.id, p.name, p.phone
+      )
+      SELECT
+        visit_id,
+        patient_id,
+        patient_name,
+        patient_phone,
+        total_bill,
+        paid_amount,
+        waived_amount,
+        (total_bill - paid_amount - waived_amount)::int AS balance,
+        created_at,
+        COUNT(*) OVER ()::int AS result_count,
+        COALESCE(SUM(total_bill - paid_amount - waived_amount) OVER (), 0)::int AS result_total
+      FROM bill_balances
+      WHERE total_bill - paid_amount - waived_amount > 0
+      ORDER BY balance DESC, visit_id ASC
+      LIMIT ${limit} OFFSET ${offset}
     `
 
-    // ── Pharmacy: customers with credit sales in period and current balance > 0 ──
-    const pharmacyCustomers = await prisma.pharmacyCustomer.findMany({
-      where: {
-        sales: {
-          some: {
-            payment_method: 'credit',
-            sold_at: { gte: fromDate, lte: toDate },
-          },
-        },
-      },
-      include: {
-        sales: {
-          where: { payment_method: 'credit' },
-          select: { total: true, sold_at: true },
-        },
-        payments: {
-          select: { amount: true, method: true, reference: true, created_at: true },
-        },
-      },
-      orderBy: { name: 'asc' },
-    })
+    const total = rows[0]?.result_count ?? 0
+    const totalOutstanding = rows[0]?.result_total ?? 0
 
-    const pharmacyRows = pharmacyCustomers
-      .map((c) => {
-        const totalCredit = c.sales.reduce((s, sale) => s + sale.total, 0)
-        const totalPaid = c.payments
-          .filter((p) => p.method !== 'waiver')
-          .reduce((s, p) => s + p.amount, 0)
-        const totalWaived = c.payments
-          .filter((p) => p.method === 'waiver')
-          .reduce((s, p) => s + p.amount, 0)
-        const balance = totalCredit - totalPaid - totalWaived
-        if (balance <= 0) return null
+    const outstanding = rows.map((r) => ({
+      source: 'clinic',
+      entity_id: r.visit_id,
+      patient_id: r.patient_id,
+      patient_name: r.patient_name,
+      patient_phone: r.patient_phone,
+      total_bill: r.total_bill,
+      paid_amount: r.paid_amount,
+      waived_amount: r.waived_amount,
+      balance: r.balance,
+      created_at: r.created_at,
+    }))
 
-        return {
-          source: 'pharmacy',
-          entity_id: c.id,
-          patient_id: c.id,
-          patient_name: c.name,
-          patient_phone: c.phone,
-          total_bill: totalCredit,
-          paid_amount: totalPaid,
-          waived_amount: totalWaived,
-          balance,
-          created_at: c.sales[0]?.sold_at || new Date(),
-        }
-      })
-      .filter(Boolean)
-
-    // ── Merge, sort by balance desc, paginate in-memory ──
-    const all = [...clinicRows, ...pharmacyRows].sort((a, b) => b.balance - a.balance)
-    const total = all.length
-    const outstanding = all.slice(offset, offset + limit)
-    const totalOutstanding = all.reduce((s, r) => s + (r.balance || 0), 0)
-
-    res.json({
+    return res.json({
       outstanding,
       total_outstanding: totalOutstanding,
       count: total,
+      total,
       page,
       pages: Math.max(1, Math.ceil(total / limit)),
-      total,
     })
   } catch (err) {
-    console.error('Outstanding balances error:', err)
-    res.status(500).json({ error: 'Failed to load outstanding balances' })
+    console.error('getOutstandingBalances error:', err.message)
+    return res.status(500).json({ error: 'Failed to load outstanding balances' })
   }
 }
 
 // PATCH /api/admin/outstanding-balances/:id
 module.exports.updateOutstandingBalance = async (req, res) => {
   try {
-    const entityId = Number(req.params.visitId)
-    const { source, action, amount, method, reference, reason } = req.body
-
-    if (!source || !['clinic', 'pharmacy'].includes(source)) {
-      return res.status(400).json({ error: 'source must be clinic or pharmacy' })
+    const { action, amount, method, reference, reason } = req.body
+    const visitId = Number(req.params.visitId)
+    if (!Number.isInteger(visitId)) {
+      return res.status(400).json({ error: 'Invalid visit id' })
     }
-
-    // ═══════════════════════════════════════════════════════════
-    // PHARMACY
-    // ═══════════════════════════════════════════════════════════
-    if (source === 'pharmacy') {
-      const customerId = entityId
-
-      if (action === 'settle') {
-        const settleAmount = Number(amount)
-        if (!Number.isFinite(settleAmount) || settleAmount <= 0) {
-          return res.status(400).json({ error: 'Invalid settlement amount' })
-        }
-
-        const result = await prisma.$transaction(async (tx) => {
-          const customer = await tx.pharmacyCustomer.findUnique({
-            where: { id: customerId },
-            include: {
-              sales: { where: { payment_method: 'credit' }, select: { total: true } },
-              payments: true,
-            },
-          })
-          if (!customer) throw Object.assign(new Error('Customer not found'), { status: 404 })
-
-          const totalCredit = customer.sales.reduce((s, sale) => s + sale.total, 0)
-          const totalPaid = customer.payments
-            .filter((p) => p.method !== 'waiver')
-            .reduce((s, p) => s + p.amount, 0)
-          const totalWaived = customer.payments
-            .filter((p) => p.method === 'waiver')
-            .reduce((s, p) => s + p.amount, 0)
-          const balance = totalCredit - totalPaid - totalWaived
-
-          if (balance <= 0) throw Object.assign(new Error('Customer has no outstanding balance'), { status: 400 })
-          if (settleAmount > balance) throw Object.assign(new Error(`Amount exceeds balance of ${balance}`), { status: 400, meta: { balance } })
-
-          await tx.customerPayment.create({
-            data: {
-              customer_id: customerId,
-              amount: Math.round(settleAmount),
-              method: method || 'cash',
-              reference: reference || null,
-              staff_id: req.user?.id || null,
-            },
-          })
-
-          return { customer, totalCredit, totalPaid: totalPaid + settleAmount, totalWaived, newBalance: balance - settleAmount }
-        })
-
-        return res.json({
-          row: {
-            source: 'pharmacy',
-            entity_id: customerId,
-            patient_id: customerId,
-            patient_name: result.customer.name,
-            patient_phone: result.customer.phone,
-            total_bill: result.totalCredit,
-            paid_amount: result.totalPaid,
-            waived_amount: result.totalWaived,
-            balance: result.newBalance,
-          },
-        })
-      }
-
-      if (action === 'waive') {
-        if (!reason?.trim()) {
-          return res.status(400).json({ error: 'Reason is required for waiver' })
-        }
-
-        const result = await prisma.$transaction(async (tx) => {
-          const customer = await tx.pharmacyCustomer.findUnique({
-            where: { id: customerId },
-            include: {
-              sales: { where: { payment_method: 'credit' }, select: { total: true } },
-              payments: true,
-            },
-          })
-          if (!customer) throw Object.assign(new Error('Customer not found'), { status: 404 })
-
-          const totalCredit = customer.sales.reduce((s, sale) => s + sale.total, 0)
-          const totalPaid = customer.payments
-            .filter((p) => p.method !== 'waiver')
-            .reduce((s, p) => s + p.amount, 0)
-          const totalWaived = customer.payments
-            .filter((p) => p.method === 'waiver')
-            .reduce((s, p) => s + p.amount, 0)
-          const balance = totalCredit - totalPaid - totalWaived
-
-          const waiveAmt =
-            Number.isFinite(Number(amount)) && Number(amount) > 0 && Number(amount) < balance
-              ? Number(amount)
-              : balance
-
-          await tx.customerPayment.create({
-            data: {
-              customer_id: customerId,
-              amount: Math.round(waiveAmt),
-              method: 'waiver',
-              reference: reason.trim(),
-              staff_id: req.user?.id || null,
-            },
-          })
-
-          return { customer, totalCredit, totalPaid, totalWaived: totalWaived + waiveAmt, newBalance: balance - waiveAmt }
-        })
-
-        return res.json({
-          row: {
-            source: 'pharmacy',
-            entity_id: customerId,
-            patient_id: customerId,
-            patient_name: result.customer.name,
-            patient_phone: result.customer.phone,
-            total_bill: result.totalCredit,
-            paid_amount: result.totalPaid,
-            waived_amount: result.totalWaived,
-            balance: result.newBalance,
-          },
-        })
-      }
-
+    if (!['settle', 'waive'].includes(action)) {
       return res.status(400).json({ error: 'Invalid action' })
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // CLINIC (your existing logic, untouched except param name)
-    // ═══════════════════════════════════════════════════════════
-    const visitId = entityId
+    const currentUser = req.user
+    const ip = req.ip ?? req.headers['x-forwarded-for'] ?? null
 
-    const bill = await prisma.bill.findUnique({
-      where: { visit_id: visitId },
-      include: {
-        payments: true,
-        visit: {
-          include: {
-            patient: { select: { id: true, name: true, phone: true } },
+    const result = await prisma.$transaction(async (tx) => {
+      const httpError = (message, status = 400) =>
+        Object.assign(new Error(message), { status })
+
+      const existing = await tx.bill.findUnique({
+        where: { visit_id: visitId },
+        select: { id: true },
+      })
+      if (!existing) throw httpError('Bill not found', 404)
+
+      // Lock before reading the balance, or two cashiers both pass the guard.
+      await tx.$executeRaw`SELECT id FROM bills WHERE id = ${existing.id} FOR UPDATE`
+
+      const bill = await tx.bill.findUnique({
+        where: { id: existing.id },
+        include: {
+          payments: { select: { amount: true } },
+          visit: { include: { patient: { select: { id: true, name: true, phone: true } } } },
+        },
+      })
+
+      // Billed comes from the fee columns. Bill.total_amount is stale.
+      const billed =
+        bill.consultation_fee + bill.lab_fee + bill.medication_fee + bill.procedure_fee
+      const paidAmount = bill.payments.reduce((s, p) => s + p.amount, 0)
+      const balance = Math.max(0, billed - paidAmount - bill.discount_amount)
+
+      if (balance <= 0) throw httpError('This bill has no outstanding balance', 409)
+
+      if (action === 'settle') {
+        const amt = Number(amount)
+        if (!Number.isInteger(amt) || amt <= 0) {
+          throw httpError('Amount must be a positive whole number')
+        }
+        if (amt > balance) {
+          throw httpError(`Amount exceeds balance of ${balance}`, 400)
+        }
+
+        await tx.payment.create({
+          data: {
+            bill_id: bill.id,
+            amount: amt,
+            method: method || 'cash',
+            reference: reference?.trim() || null,
+            stage: 2,
+            cashier_id: currentUser?.id ?? null,
           },
-        },
-      },
-    })
+        })
 
-    if (!bill) return res.status(404).json({ error: 'Bill not found' })
+        const newPaid = paidAmount + amt
+        const newBalance = billed - newPaid - bill.discount_amount
 
-    const paidAmount = bill.payments.reduce((s, p) => s + p.amount, 0)
-    const currentBalance = Math.max(0, bill.total_amount - paidAmount - bill.discount_amount)
+        if (newBalance <= 0) {
+          await tx.bill.update({
+            where: { id: bill.id },
+            data: { stage2_status: 'paid', stage2_paid_at: new Date(), fee_status: 'paid' },
+          })
+          await tx.visit.update({ where: { id: visitId }, data: { status: 'done' } })
+        }
 
-    if (action === 'settle') {
-      const settleAmount = Number(amount)
-      if (!Number.isFinite(settleAmount) || settleAmount <= 0 || settleAmount > currentBalance) {
-        return res.status(400).json({ error: 'Invalid settlement amount' })
+        return {
+          action: 'settle',
+          amount: amt,
+          bill,
+          billed,
+          paid: newPaid,
+          waived: bill.discount_amount,
+          balance: Math.max(0, newBalance),
+        }
       }
 
-      await prisma.payment.create({
-        data: {
-          bill_id: bill.id,
-          amount: Math.round(settleAmount),
-          method: method || 'cash',
-          reference: reference || null,
-          stage: 2,
-          cashier_id: req.user?.id || null,
-        },
-      })
+      // waive
+      if (!reason?.trim()) throw httpError('Reason is required for a waiver')
 
-      const newPaid = paidAmount + settleAmount
-      const newBalance = Math.max(0, bill.total_amount - newPaid - bill.discount_amount)
-      const newStatus = newBalance <= 0 ? 'paid' : bill.fee_status
+      const requested = Number(amount)
+      const waiveAmt =
+        Number.isInteger(requested) && requested > 0 && requested < balance
+          ? requested
+          : balance
 
-      if (newStatus !== bill.fee_status) {
-        await prisma.bill.update({ where: { id: bill.id }, data: { fee_status: newStatus } })
-      }
+      const newDiscount = bill.discount_amount + waiveAmt
+      const newBalance = billed - paidAmount - newDiscount
 
-      return res.json({
-        row: {
-          source: 'clinic',
-          entity_id: visitId,
-          patient_id: bill.visit.patient.id,
-          patient_name: bill.visit.patient.name,
-          patient_phone: bill.visit.patient.phone,
-          total_bill: bill.total_amount,
-          paid_amount: newPaid,
-          waived_amount: bill.discount_amount,
-          balance: newBalance,
-        },
-      })
-    }
-
-    if (action === 'waive') {
-      if (!reason?.trim()) return res.status(400).json({ error: 'Reason is required for waiver' })
-
-      const waiveAmount =
-        Number.isFinite(Number(amount)) && Number(amount) > 0 && Number(amount) < currentBalance
-          ? Number(amount)
-          : currentBalance
-
-      const newDiscount = bill.discount_amount + waiveAmount
-      const newBalance = Math.max(0, bill.total_amount - paidAmount - newDiscount)
-      const newStatus = newBalance <= 0 ? 'waived' : bill.fee_status
-
-      await prisma.bill.update({
+      await tx.bill.update({
         where: { id: bill.id },
         data: {
           discount_amount: newDiscount,
           discount_reason: reason.trim(),
-          fee_status: newStatus,
+          ...(newBalance <= 0 && {
+            stage2_status: 'waived',
+            stage2_waived_at: new Date(),
+            stage2_waived_by: currentUser?.username ?? 'unknown',
+            stage2_waive_reason: reason.trim(),
+            // 'paid' when cash was collected, 'waived' when nothing was.
+            fee_status: paidAmount > 0 ? 'paid' : 'waived',
+          }),
         },
       })
 
-      return res.json({
-        row: {
-          source: 'clinic',
-          entity_id: visitId,
-          patient_id: bill.visit.patient.id,
-          patient_name: bill.visit.patient.name,
-          patient_phone: bill.visit.patient.phone,
-          total_bill: bill.total_amount,
-          paid_amount: paidAmount,
-          waived_amount: newDiscount,
-          balance: newBalance,
-        },
-      })
-    }
+      if (newBalance <= 0) {
+        await tx.visit.update({ where: { id: visitId }, data: { status: 'done' } })
+      }
 
-    res.status(400).json({ error: 'Invalid action' })
+      return {
+        action: 'waive',
+        amount: waiveAmt,
+        bill,
+        billed,
+        paid: paidAmount,
+        waived: newDiscount,
+        balance: Math.max(0, newBalance),
+      }
+    })
+
+    await writeAuditLog({
+      staffId: currentUser?.id,
+      user: currentUser?.username,
+      action: result.action === 'settle' ? 'Debt Settled' : 'Balance Waived',
+      description:
+        `${result.action === 'settle' ? 'Collected' : 'Waived'} ${result.amount} ` +
+        `for ${result.bill.visit.patient.name} — visit #${visitId}, ` +
+        `remaining ${result.balance}` +
+        (result.action === 'waive' ? ` — reason: ${reason.trim()}` : ''),
+      category: 'payment',
+      entity: 'Bill',
+      entityId: result.bill.id,
+      ipAddress: ip,
+    })
+
+    return res.json({
+      row: {
+        source: 'clinic',
+        entity_id: visitId,
+        patient_id: result.bill.visit.patient.id,
+        patient_name: result.bill.visit.patient.name,
+        patient_phone: result.bill.visit.patient.phone,
+        total_bill: result.billed,
+        paid_amount: result.paid,
+        waived_amount: result.waived,
+        balance: result.balance,
+      },
+    })
   } catch (err) {
     if (err.status) return res.status(err.status).json({ error: err.message, ...err.meta })
     console.error('Update outstanding error:', err)

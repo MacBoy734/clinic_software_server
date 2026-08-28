@@ -25,6 +25,7 @@ router.get('/drugs', REQUESTERS, c.getDrugs)
 // ─── Stock table ──────────────────────────────────────────────────────────────
 
 router.get('/stock', PHARMACY, c.getStock)
+router.patch('/stock/:id', PHARMACY, validate({ params: schemas.idParamSchema }), c.updateShelfLocation)
 
 // ─── Restock requests ─────────────────────────────────────────────────────────
 

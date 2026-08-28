@@ -1,14 +1,13 @@
 const rateLimit = require('express-rate-limit')
 
 // ── Standard API limit ──────────────────────────────────────────
-// 100 requests per 15 minutes per IP
 const standardLimit = rateLimit({
   windowMs: 5 * 60 * 1000,
-  max: 100,
+  max: 150,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests — please slow down' },
-  skip: (req) => req.path === '/api/health', // skip health checks
+  skip: (req) => req.path === '/api/health', 
 })
 
 // ── Strict limit for auth ───────────────────────────────────────

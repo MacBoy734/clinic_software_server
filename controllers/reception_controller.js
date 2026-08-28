@@ -48,7 +48,7 @@ module.exports.getQueue = async (req, res) => {
     const visits = await prisma.visit.findMany({
       where,
       include: VISIT_INCLUDE,
-      orderBy: [{ queue_number: 'asc' }, { arrived_at: 'asc' }],
+      orderBy: [{ arrived_at: 'desc' }],
     })
     return res.json(visits)
   } catch (error) {
@@ -61,27 +61,43 @@ module.exports.getQueue = async (req, res) => {
 
 module.exports.getStats = async (req, res) => {
   try {
-    const range = todayRange()
+    const range = todayRange();
 
-    const [total, done, waiting, revenue] = await Promise.all([
+    const [total, done, waiting, payments] = await Promise.all([
       prisma.visit.count({ where: { arrived_at: range } }),
       prisma.visit.count({ where: { arrived_at: range, status: 'done' } }),
       prisma.visit.count({ where: { arrived_at: range, status: 'waiting' } }),
-      prisma.payment.aggregate({
+      prisma.payment.groupBy({
+        by: ['method'],
         where: { paid_at: range },
         _sum: { amount: true },
+        _count: { _all: true },
       }),
-    ])
+    ]);
+
+    const by_method = { cash: 0, mpesa: 0, insurance: 0, credit: 0, other: 0 };
+    const counts = { cash: 0, mpesa: 0, insurance: 0, credit: 0, other: 0 };
+    let revenue_today = 0;
+
+    for (const p of payments) {
+      const amount = p._sum.amount ?? 0;
+      by_method[p.method] = amount;
+      counts[p.method] = p._count._all;
+      revenue_today += amount;
+    }
 
     return res.json({
       total_visits: total,
       done,
       waiting,
-      revenue_today: revenue._sum.amount || 0,
-    })
+      revenue_today,
+      payments: {
+        by_method,
+      },
+    });
   } catch (error) {
-    console.error('getStats error:', error)
-    return res.status(500).json({ error: 'Failed to fetch stats' })
+    console.error('getStats error:', error.message);
+    return res.status(500).json({ error: 'Failed to fetch stats' });
   }
 }
 
@@ -137,7 +153,12 @@ module.exports.getBills = async (req, res) => {
     const currentUser = req.user
     const bills = await prisma.bill.findMany({
       where: {
-        stage2_status: 'pending',
+        visit: { status: { in: ['done', 'archived', 'billing'] } },
+        OR: [
+          { stage2_status: 'pending' },
+          { fee_status: 'paid', stage2_paid_at: todayRange() },
+          { fee_status: 'paid', stage2_waived_at: todayRange() }
+        ]
       },
       include: {
         visit: {
@@ -154,7 +175,7 @@ module.exports.getBills = async (req, res) => {
         },
         payments: {
           orderBy: { paid_at: 'asc' },
-          select: { amount: true, method: true, reference: true, stage: true, paid_at: true, cashier: {select: {username: true}}}
+          select: { amount: true, method: true, reference: true, stage: true, paid_at: true, cashier: { select: { username: true } } }
         }
       },
       orderBy: { created_at: 'asc' }
@@ -198,18 +219,6 @@ module.exports.getBills = async (req, res) => {
 
       const payable_amount = Math.max(0, effective_total - discount_amount - paid_amount)
 
-      // A bill is resolved when every stage is either paid or waived (or irrelevant)
-      const stage1Resolved =
-        b.visit.visit_type !== 'consultation' ||
-        b.consultation_fee_status === 'paid' ||
-        b.consultation_fee_status === 'waived'
-      const stage2Total = b.lab_fee + b.medication_fee + b.procedure_fee
-      const stage2Resolved =
-        stage2Total === 0 ||
-        b.stage2_status === 'paid' ||
-        b.stage2_status === 'waived'
-      const is_resolved = stage1Resolved && stage2Resolved
-
       return {
         id: b.id,
         cashier: lastCashier,
@@ -225,8 +234,8 @@ module.exports.getBills = async (req, res) => {
         discount_reason: b.discount_reason || null,
         payable_amount,
         paid_amount,
+        stage2_status: b.stage2_status,
         status: b.fee_status,
-        is_resolved,                            // ← NEW: use this for grouping
         method: lastPayment?.method ?? null,
         payments: b.payments.map((p) => ({
           amount: p.amount,
@@ -313,7 +322,7 @@ module.exports.registerVisit = async (req, res) => {
 
       if (!pid) throw httpError('Could not resolve patient')
 
-      const labFeeTotal = labItems.reduce((sum, t) => sum + (t.unit_cost || 0), 0)
+      const labFeeTotal = labItems.reduce((sum, t) => sum + t.unit_cost, 0)
 
       const billData = {
         consultation_fee_status: visit_type === 'consultation' ? 'pending' : 'waived',
@@ -513,7 +522,6 @@ module.exports.collectPayment = async (req, res) => {
             consultation_fee_status: 'paid',
             consultation_fee: paymentsSum,
             consultation_fee_status_paid_at: now,
-            total_amount: paymentsSum,
           },
         })
 
@@ -550,11 +558,11 @@ module.exports.collectPayment = async (req, res) => {
       }
 
       const required = billTotal - discount_amount - alreadyPaid
-      if (paymentsSum !== required) {
-        throw httpError(
-          `Payments (${paymentsSum}) must settle the outstanding balance exactly: ` +
-          `total ${billTotal} − discount ${discount_amount} − already paid ${alreadyPaid} = ${required}`
-        )
+      if (paymentsSum <= 0) {
+        throw httpError('Payment amount must be greater than 0', 400)
+      }
+      if (paymentsSum > required) {
+        throw httpError(`Payments (${paymentsSum}) exceed the outstanding balance (${required})`)
       }
 
       await tx.payment.createMany({
@@ -569,24 +577,31 @@ module.exports.collectPayment = async (req, res) => {
         })),
       })
 
+      const newTotalPaid = alreadyPaid + paymentsSum
+      const remainingBalance = Math.max(0, billTotal - discount_amount - newTotalPaid)
+      const isFullyPaid = remainingBalance <= 0
+      const isConsultationResolved = ['paid', 'waived'].includes(bill.consultation_fee_status)
+      const isStage2Resolved = isFullyPaid || bill.stage2_status === 'waived'
+      const overallStatus = (isConsultationResolved && isStage2Resolved) ? 'paid' : 'pending'
+
       await tx.bill.update({
         where: { id: bill.id },
         data: {
-          stage2_status: 'paid',
-          stage2_paid_at: now,
+          stage2_status: isFullyPaid ? 'paid' : 'pending',
+          stage2_paid_at: isFullyPaid ? now : null,
           total_amount: billTotal,
           discount_amount: discount_amount,
           discount_reason: discount_reason,
-          fee_status: 'paid',
+          fee_status: overallStatus,
         },
       })
 
       await tx.visit.update({
         where: { id: visit_id },
-        data: { status: 'done' },
+        data: { status: isFullyPaid ? 'done' : 'partially_paid' },
       })
 
-      return { stage: 2, visit, next_status: 'done', billTotal, discount: discount_amount }
+      return { stage: 2, visit, next_status: 'done', billTotal, discount: discount_amount, paid: newTotalPaid, remaining: remainingBalance }
     })
 
     const patientName = result.visit?.patient?.name ?? 'Unknown'
@@ -600,6 +615,7 @@ module.exports.collectPayment = async (req, res) => {
         description:
           `Stage ${result.stage} payment of ${paymentsSum} (${methodSummary})` +
           (result.stage === 2 && result.discount > 0 ? ` with discount ${result.discount} (${discount_reason})` : '') +
+          (result.remaining > 0 ? ` — partial, balance ${result.remaining}` : '') +
           ` recorded for ${patientName} — visit #${visit_id}`,
         category: 'payment',
         ipAddress: ip,
@@ -647,7 +663,9 @@ module.exports.collectPayment = async (req, res) => {
       next_status: result.next_status,
       message: result.stage === 1
         ? 'Stage 1 payment collected — patient ready for doctor'
-        : 'Stage 2 payment collected — visit complete',
+        : result.remaining > 0
+          ? `Partial payment recorded — balance ${result.remaining}`
+          : 'Stage 2 payment collected — visit complete',
     })
 
   } catch (error) {
@@ -748,9 +766,6 @@ module.exports.waivePayment = async (req, res) => {
       }
 
       const stage2Total = bill.lab_fee + bill.medication_fee + bill.procedure_fee
-      if (stage2Total === 0) {
-        throw httpError('No stage 2 fees to waive', 400)
-      }
 
       // If stage 1 was also waived (or no consultation fee), overall is waived
       // If stage 1 was paid, overall stays paid (money did change hands)

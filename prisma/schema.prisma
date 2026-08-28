@@ -45,6 +45,7 @@ enum VisitStatus {
   billing
   done
   archived
+  partially_paid
 }
 
 enum FeeStatus {
@@ -501,6 +502,7 @@ model Product {
   generic_name String?
   form         String?
   strength     String?
+  shelf_location String?
 
   current_stock Int @default(0)
   reorder_level Int @default(50)

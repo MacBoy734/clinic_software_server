@@ -1,5 +1,5 @@
 const prisma = require('../lib/prisma')
-const { getPeriodRange } = require('../utils/helpers')
+const { getPeriodRange, writeAuditLog } = require('../utils/helpers')
 
 // ─── Domain/role authorization ───────────────────────────────────────────────
 
@@ -201,10 +201,17 @@ module.exports.getExpenseStats = async (req, res) => {
 module.exports.createExpense = async (req, res) => {
   const resolved = resolveDomain(req)
   const domainError = domainErrorResponse(res, resolved)
+  const ip = req.ip ?? null
+  const currentUser = req.user
   if (domainError) return domainError
   if (requireSingleDomain(res, resolved)) return
 
-  const { description, amount, incurred_at } = req.body
+    const { description, amount, incurred_at } = req.body
+
+  const amt = Math.round(Number(amount))
+  if (!Number.isInteger(amt) || amt <= 0) {
+    return res.status(400).json({ error: 'Amount must be a positive whole number' })
+  }
 
   try {
     const expense = await resolved.model.create({
@@ -212,10 +219,25 @@ module.exports.createExpense = async (req, res) => {
         description,
         amount,
         incurred_at: incurred_at || new Date(),
-        recorded_by: req.user.userId ?? null,
+        recorded_by: req.user.id ?? null,
       },
       include: RECORDER_INCLUDE,
     })
+
+    try {
+      await writeAuditLog({
+        staffId: currentUser?.id,
+        user: currentUser?.username,
+        action: 'Recorded Expense',
+        description: `Recorded expense with description: ${description}, amount: ${amount}`,
+        category: 'Expense',
+        entity: 'Expense',
+        entityId: expense.id,
+        ipAddress: ip,
+      })
+    } catch (sideErr) {
+      console.error('record expense side effect failed:', sideErr.message)
+    }
 
     return res.status(201).json(shapeExpense(expense, resolved.domain))
   } catch (error) {
@@ -224,7 +246,6 @@ module.exports.createExpense = async (req, res) => {
   }
 }
 
-// ─── PUT /api/expenses/:id ─────────────────────────────────────────────────────
 module.exports.updateExpense = async (req, res) => {
   const resolved = resolveDomain(req)
   const domainError = domainErrorResponse(res, resolved)
@@ -233,8 +254,13 @@ module.exports.updateExpense = async (req, res) => {
 
   const { id } = req.params
   const { description, amount, incurred_at } = req.body
+  const currentUser = req.user
+  const ip = req.ip ?? null
 
   try {
+    const before = await resolved.model.findUnique({ where: { id } })
+    if (!before) return res.status(404).json({ error: 'Expense not found' })
+
     const expense = await resolved.model.update({
       where: { id },
       data: {
@@ -244,6 +270,35 @@ module.exports.updateExpense = async (req, res) => {
       },
       include: RECORDER_INCLUDE,
     })
+
+    // Amount changes are the reason this log exists — record both values.
+    const changes = []
+    if (before.description !== expense.description) {
+      changes.push(`description "${before.description}" → "${expense.description}"`)
+    }
+    if (before.amount !== expense.amount) {
+      changes.push(`amount ${before.amount} → ${expense.amount}`)
+    }
+    if (before.incurred_at.getTime() !== expense.incurred_at.getTime()) {
+      changes.push(`date ${before.incurred_at.toISOString().slice(0, 10)} → ${expense.incurred_at.toISOString().slice(0, 10)}`)
+    }
+
+    try {
+      await writeAuditLog({
+        staffId: currentUser?.id,
+        user: currentUser?.username,
+        action: 'Updated Expense',
+        description: changes.length
+          ? `Updated ${resolved.domain} expense #${id}: ${changes.join(', ')}`
+          : `Updated ${resolved.domain} expense #${id} (no field changed)`,
+        category: 'Expense',
+        entity: 'Expense',
+        entityId: expense.id,
+        ipAddress: ip,
+      })
+    } catch (sideErr) {
+      console.error('update expense audit log failed:', sideErr.message)
+    }
 
     return res.json(shapeExpense(expense, resolved.domain))
   } catch (error) {
@@ -256,6 +311,7 @@ module.exports.updateExpense = async (req, res) => {
 }
 
 // ─── DELETE /api/expenses/:id ─────────────────────────────────────────────────
+// ─── DELETE /api/expenses/:id ─────────────────────────────────────────────────
 module.exports.deleteExpense = async (req, res) => {
   const resolved = resolveDomain(req)
   const domainError = domainErrorResponse(res, resolved)
@@ -263,9 +319,33 @@ module.exports.deleteExpense = async (req, res) => {
   if (requireSingleDomain(res, resolved)) return
 
   const { id } = req.params
+  const currentUser = req.user
+  const ip = req.ip ?? null
 
   try {
+    const existing = await resolved.model.findUnique({ where: { id } })
+    if (!existing) return res.status(404).json({ error: 'Expense not found' })
+
     await resolved.model.delete({ where: { id } })
+
+    try {
+      await writeAuditLog({
+        staffId: currentUser?.id,
+        user: currentUser?.username,
+        action: 'Deleted Expense',
+        // The row is gone — the log is the only remaining record of it.
+        description:
+          `Deleted ${resolved.domain} expense #${id}: "${existing.description}", ` +
+          `amount ${existing.amount}, incurred ${existing.incurred_at.toISOString().slice(0, 10)}`,
+        category: 'Expense',
+        entity: 'Expense',
+        entityId: Number(id),
+        ipAddress: ip,
+      })
+    } catch (sideErr) {
+      console.error('delete expense audit log failed:', sideErr.message)
+    }
+
     return res.json({ message: 'Expense deleted successfully' })
   } catch (error) {
     if (error.code === 'P2025') {

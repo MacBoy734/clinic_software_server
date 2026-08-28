@@ -161,19 +161,21 @@ const labCatalogUpdateSchema = z.object({
 // ADMIN — EXPENSES (consolidated)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const createExpenseSchema = z.object({
-  domain: ExpenseDomainEnum.optional(),
-  description: ShortString,
-  amount: Money.refine((n) => n > 0, 'Amount must be greater than 0'),
-  category: NullableString,
-  incurred_at: DateField.optional(),
+const PERIODS = ['today', 'this_week', 'this_month', 'last_30_days', 'this_year']
+
+const getExpensesQuerySchema = z.object({
+  domain: z.enum(['clinic', 'pharmacy']).optional(),
+  period: z.enum(PERIODS).default('this_month'),
+  search: z.string().trim().max(100).optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
 })
 
-const updateExpenseSchema = z.object({
-  description: ShortString.optional(),
-  amount: Money.refine((n) => n > 0, 'Amount must be greater than 0').optional(),
-  incurred_at: DateField.optional(),
-}).refine((data) => Object.keys(data).length > 0, { message: 'No fields to update' })
+const getExpenseStatsQuerySchema = z.object({
+  domain: z.enum(['clinic', 'pharmacy']).optional(),
+  period: z.enum(PERIODS).default('this_month'),
+})
+
 
 const expenseIdSchema = z.coerce.number().int().positive('Invalid expense ID')
 
@@ -451,7 +453,6 @@ const orderItemSchema = z.object({
 }).refine((data) => data.product_id || data.name, { message: 'Each item needs a product or a name' })
 
 const createInternalOrderSchema = z.object({
-  department: OrderDepartmentEnum,
   items: z.array(orderItemSchema).min(1),
   notes: NullableString,
 })
@@ -580,11 +581,14 @@ module.exports = {
 
   // Admin
   clinicSettingsSchema, pharmacySettingsSchema, securitySettingsSchema, patchSettingsSchema,
-  chargeTemplateSchema, updateChargeTemplateSchema, labCatalogUpdateSchema,
-  createExpenseSchema, updateExpenseSchema, expenseIdSchema,
+  chargeTemplateSchema, updateChargeTemplateSchema, labCatalogUpdateSchema, expenseIdSchema,
   createLabStockSchema, updateLabStockSchema, updateLabStockQuantitySchema,
   createDrugStockSchema, updateDrugStockSchema, updateDrugStockQuantitySchema,
   createReferralSchema, payReferralSchema, verifyRestockSchema, rejectRestockSchema,
+
+  // Expenses
+  getExpenseStatsQuerySchema, getExpensesQuerySchema,
+
 
   // Patients
   newPatientSchema, patientSearchSchema, registerVisitSchema, vitalsSchema, patchVisitSchema,
