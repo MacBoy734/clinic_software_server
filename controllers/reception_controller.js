@@ -458,17 +458,31 @@ module.exports.collectPayment = async (req, res) => {
   const currentUser = req.user
   const io = getIO()
 
-  const paymentsSum = payments.reduce((s, p) => s + p.amount, 0)
-
   try {
+    if (!Array.isArray(payments) || payments.length === 0) {
+      return res.status(400).json({ error: 'At least one payment line is required' })
+    }
+    if (![1, 2].includes(stage)) {
+      return res.status(400).json({ error: 'Invalid stage. Must be 1 or 2' })
+    }
+
+    const paymentsSum = payments.reduce((s, p) => s + (parseInt(p.amount) || 0), 0)
+    if (paymentsSum <= 0) {
+      return res.status(400).json({ error: 'Payment amount must be greater than 0' })
+    }
+
+    // An omitted discount would make `required` NaN, which silently passes
+    // every comparison below and records a full payment as unpaid.
+    const discount = Number(discount_amount) || 0
+
     const result = await prisma.$transaction(async (tx) => {
       const httpError = (message, status = 400) =>
         Object.assign(new Error(message), { status })
 
-      // Defensive: Zod should catch this, but never trust the edge
-      if (![1, 2].includes(stage)) {
-        throw httpError('Invalid stage. Must be 1 or 2', 400)
-      }
+      // Lock the bill row BEFORE reading it. Two cashiers on the same bill
+      // would otherwise both read the same alreadyPaid, both pass the
+      // over-payment guard, then serialise here and both write.
+      await tx.$executeRaw`SELECT id FROM bills WHERE visit_id = ${visit_id} FOR UPDATE`
 
       const visit = await tx.visit.findUnique({
         where: { id: visit_id },
@@ -480,9 +494,6 @@ module.exports.collectPayment = async (req, res) => {
 
       if (!visit) throw httpError('Visit not found', 404)
       if (!visit.bill) throw httpError('No bill found for this visit', 404)
-      // ── ROW LOCK: prevents two cashiers paying the same bill simultaneously ──
-      if (!visit.bill.id) throw httpError('Bill ID missing', 500)
-      await tx.$executeRaw`SELECT * FROM bills WHERE id = ${visit.bill.id} FOR UPDATE`
 
       const bill = visit.bill
       const cashierId = currentUser?.id ?? null
@@ -534,33 +545,31 @@ module.exports.collectPayment = async (req, res) => {
       }
 
       // ── STAGE 2 ───────────────────────────────────────────────────
-      // WORKFLOW ENFORCEMENT: patient must be at 'billing' to pay final bill
-      if (visit.status !== 'billing') {
+      // A partially paid visit sits at 'partially_paid', so it must be able
+      // to come back and top up.
+      if (!['billing', 'partially_paid'].includes(visit.status)) {
         throw httpError(
-          `Stage 2 payment can only be collected when visit status is 'billing'. Current status: ${visit.status}`,
+          `Stage 2 payment can only be collected when the visit is at billing. Current status: ${visit.status}`,
           400
         )
       }
-
       if (bill.stage2_status === 'paid') {
         throw httpError('Stage 2 payment already collected', 409)
       }
-
-      // Stage 1 must be resolved before stage 2 (for consultations)
       if (visit.visit_type === 'consultation' && bill.consultation_fee_status === 'pending') {
         throw httpError('Stage 1 must be paid or waived before stage 2', 400)
       }
 
-      const billTotal = bill.consultation_fee + bill.lab_fee + bill.medication_fee + bill.procedure_fee
+      const billTotal =
+        bill.consultation_fee + bill.lab_fee + bill.medication_fee + bill.procedure_fee
 
-      if (discount_amount > billTotal - alreadyPaid) {
-        throw httpError(`Discount (${discount_amount}) cannot exceed the outstanding balance (${billTotal - alreadyPaid})`)
+      if (discount > billTotal - alreadyPaid) {
+        throw httpError(
+          `Discount (${discount}) cannot exceed the outstanding balance (${billTotal - alreadyPaid})`
+        )
       }
 
-      const required = billTotal - discount_amount - alreadyPaid
-      if (paymentsSum <= 0) {
-        throw httpError('Payment amount must be greater than 0', 400)
-      }
+      const required = billTotal - discount - alreadyPaid
       if (paymentsSum > required) {
         throw httpError(`Payments (${paymentsSum}) exceed the outstanding balance (${required})`)
       }
@@ -578,11 +587,11 @@ module.exports.collectPayment = async (req, res) => {
       })
 
       const newTotalPaid = alreadyPaid + paymentsSum
-      const remainingBalance = Math.max(0, billTotal - discount_amount - newTotalPaid)
+      const remainingBalance = Math.max(0, billTotal - discount - newTotalPaid)
       const isFullyPaid = remainingBalance <= 0
       const isConsultationResolved = ['paid', 'waived'].includes(bill.consultation_fee_status)
       const isStage2Resolved = isFullyPaid || bill.stage2_status === 'waived'
-      const overallStatus = (isConsultationResolved && isStage2Resolved) ? 'paid' : 'pending'
+      const overallStatus = isConsultationResolved && isStage2Resolved ? 'paid' : 'pending'
 
       await tx.bill.update({
         where: { id: bill.id },
@@ -590,18 +599,27 @@ module.exports.collectPayment = async (req, res) => {
           stage2_status: isFullyPaid ? 'paid' : 'pending',
           stage2_paid_at: isFullyPaid ? now : null,
           total_amount: billTotal,
-          discount_amount: discount_amount,
-          discount_reason: discount_reason,
+          discount_amount: discount,
+          discount_reason: discount_reason ?? null,
           fee_status: overallStatus,
         },
       })
 
+      // Clinically finished either way — only the money decides which.
       await tx.visit.update({
         where: { id: visit_id },
         data: { status: isFullyPaid ? 'done' : 'partially_paid' },
       })
 
-      return { stage: 2, visit, next_status: 'done', billTotal, discount: discount_amount, paid: newTotalPaid, remaining: remainingBalance }
+      return {
+        stage: 2,
+        visit,
+        next_status: isFullyPaid ? 'done' : 'partially_paid',
+        billTotal,
+        discount,
+        paid: newTotalPaid,
+        remaining: remainingBalance,
+      }
     })
 
     const patientName = result.visit?.patient?.name ?? 'Unknown'
@@ -609,12 +627,14 @@ module.exports.collectPayment = async (req, res) => {
 
     try {
       await writeAuditLog({
-        staffId: currentUser.id,
-        user: currentUser.username,
+        staffId: currentUser?.id,
+        user: currentUser?.username,
         action: result.stage === 1 ? 'Stage 1 Payment' : 'Stage 2 Payment',
         description:
           `Stage ${result.stage} payment of ${paymentsSum} (${methodSummary})` +
-          (result.stage === 2 && result.discount > 0 ? ` with discount ${result.discount} (${discount_reason})` : '') +
+          (result.stage === 2 && result.discount > 0
+            ? ` with discount ${result.discount} (${discount_reason})`
+            : '') +
           (result.remaining > 0 ? ` — partial, balance ${result.remaining}` : '') +
           ` recorded for ${patientName} — visit #${visit_id}`,
         category: 'payment',
@@ -630,7 +650,7 @@ module.exports.collectPayment = async (req, res) => {
           message: `${patientName} is waiting for consultation.`,
           io,
         })
-        io.to('doctor').emit('visit:new', { visit_id: visit_id, patient_name: patientName })
+        io.to('doctor').emit('visit:new', { visit_id, patient_name: patientName })
       }
 
       if (result.stage === 2 && result.visit.visit_type === 'direct_lab') {
@@ -638,10 +658,10 @@ module.exports.collectPayment = async (req, res) => {
         if (referrer) {
           await prisma.referral.create({
             data: {
-              visit_id: visit_id,
+              visit_id,
               referrer_name: referrer,
               referrer_phone: result.visit.referrer_phone?.trim() || null,
-            }
+            },
           })
           await createNotification({
             targetRoles: ['admin'],
@@ -661,13 +681,13 @@ module.exports.collectPayment = async (req, res) => {
     return res.json({
       success: true,
       next_status: result.next_status,
-      message: result.stage === 1
-        ? 'Stage 1 payment collected — patient ready for doctor'
-        : result.remaining > 0
-          ? `Partial payment recorded — balance ${result.remaining}`
-          : 'Stage 2 payment collected — visit complete',
+      message:
+        result.stage === 1
+          ? 'Stage 1 payment collected — patient ready for doctor'
+          : result.remaining > 0
+            ? `Partial payment recorded — balance ${result.remaining}`
+            : 'Stage 2 payment collected — visit complete',
     })
-
   } catch (error) {
     if (error.status) {
       return res.status(error.status).json({ error: error.message })

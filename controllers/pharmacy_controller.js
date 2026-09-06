@@ -13,6 +13,7 @@ const MEDICATION = 'medication'
 const SUPPLY_CATEGORIES = CATEGORIES.filter((c) => c !== MEDICATION)
 
 const PRICE_TIERS = ['normal', 'promotional', 'wholesale']
+const OFF_CATALOGUE_PRICE_CAP = 20000
 const ORDER_DEPARTMENTS = ['doctor', 'lab', 'admin']
 
 exports.CATEGORIES = CATEGORIES
@@ -411,6 +412,13 @@ function shapeOrder(o) {
 }
 
 function shapeSale(s) {
+  const returnedByItem = new Map()
+  for (const r of s.returns ?? []) {
+    for (const ri of r.items ?? []) {
+      returnedByItem.set(ri.sale_item_id, (returnedByItem.get(ri.sale_item_id) || 0) + ri.quantity)
+    }
+  }
+
   return {
     id: s.id,
     receipt_number: s.receipt_number,
@@ -431,16 +439,33 @@ function shapeSale(s) {
       amount: p.amount,
       reference: p.reference,
     })),
-    items: (s.items || []).map((it) => ({
-      name: it.name,
-      quantity: it.quantity,
-      unit_price: it.unit_price,
-      tax_amount: it.tax_amount,
-      price_tier: it.price_tier,
-      product_id: it.product_id ?? null,
-      category: it.product?.category ?? null,
-      unit: it.product?.unit ?? null,
+           returns: (s.returns ?? []).map((r) => ({
+      id: r.id,
+      return_number: r.return_number,
+      cash_refund_amount: r.cash_refund_amount,
+      credit_note_amount: r.credit_note_amount,
+      refund_amount: r.cash_refund_amount + r.credit_note_amount,
+      reason: r.reason,
+      returned_by: r.returned_by,
+      created_at: r.created_at,
     })),
+    items: (s.items || []).map((it) => {
+      const returned = returnedByItem.get(it.id) || 0
+      return {
+        id: it.id,
+        product_batch_id: it.product_batch_id ?? null,
+        name: it.name,
+        quantity: it.quantity,
+        returned_qty: returned,
+        returnable_qty: it.quantity - returned,
+        unit_price: it.unit_price,
+        tax_amount: it.tax_amount,
+        price_tier: it.price_tier,
+        product_id: it.product_id ?? null,
+        category: it.product?.category ?? null,
+        unit: it.product?.unit ?? null,
+      }
+    }),
   }
 }
 
@@ -514,10 +539,10 @@ exports.getProducts = async (req, res) => {
     }
 
     const items = await prisma.product.findMany({
-        where,
-        orderBy: [{ category: 'asc' }, { name: 'asc' }],
-        take: 500,
-      })
+      where,
+      orderBy: [{ category: 'asc' }, { name: 'asc' }],
+      take: 500,
+    })
 
     const shaped = items.map((p) => shapeProduct(p))
 
@@ -573,9 +598,9 @@ exports.getStock = async (req, res) => {
     if (req.query.include_inactive !== '1') where.is_active = true
 
     const items = await prisma.product.findMany({
-        where,
-        orderBy: [{ category: 'asc' }, { sub_category: 'asc' }, { name: 'asc' }],
-      })
+      where,
+      orderBy: [{ category: 'asc' }, { sub_category: 'asc' }, { name: 'asc' }],
+    })
 
     const shaped = items.map((p) => shapeProduct(p))
 
@@ -675,7 +700,7 @@ exports.createRestockRequest = async (req, res) => {
         department: 'pharmacy',
         product_id: productId,
         lab_stock_id: null,
-        quantity: qty,    
+        quantity: qty,
         expiry_date: expiry,
         notes: (typeof notes === 'string' && notes.trim()) || null,
         status: 'pending',
@@ -963,10 +988,10 @@ exports.confirmRestock = async (req, res) => {
   try {
     const itemId = req.params.id
     const currentUser = req.user
- 
+
     const result = await prisma.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT id FROM prescription_items WHERE id = ${itemId} FOR UPDATE`
- 
+
       const item = await tx.prescriptionItem.findUnique({
         where: { id: itemId },
         include: { prescription: { select: { visit_id: true } } },
@@ -978,7 +1003,7 @@ exports.confirmRestock = async (req, res) => {
           { status: 409 }
         )
       }
- 
+
       let stockRestored = false
       if (item.product_id) {
         await giveStock(tx, {
@@ -993,7 +1018,7 @@ exports.confirmRestock = async (req, res) => {
         })
         stockRestored = true
       }
- 
+
       await tx.prescriptionItem.update({
         where: { id: itemId },
         data: {
@@ -1002,10 +1027,10 @@ exports.confirmRestock = async (req, res) => {
           restocked_at: new Date(),
         },
       })
- 
+
       // No fee recompute: the charge came off at return time, and `restocked`
       // is not billable either.
- 
+
       return {
         visitId: item.prescription.visit_id,
         drugName: item.drug_name,
@@ -1013,7 +1038,7 @@ exports.confirmRestock = async (req, res) => {
         stockRestored,
       }
     })
- 
+
     try {
       const io = safeIO()
       if (io) io.to('doctor').emit('prescription:restocked', { visit_id: result.visitId, item_id: itemId })
@@ -1030,7 +1055,7 @@ exports.confirmRestock = async (req, res) => {
     } catch (sideErr) {
       console.error('confirmRestock side effect failed:', sideErr.message)
     }
- 
+
     res.json({
       success: true,
       stock_restored: result.stockRestored,
@@ -1044,7 +1069,7 @@ exports.confirmRestock = async (req, res) => {
     res.status(500).json({ error: 'Failed to confirm restock' })
   }
 }
- 
+
 
 
 exports.cancelPrescription = async (req, res) => {
@@ -1166,6 +1191,23 @@ exports.createOtcSale = async (req, res) => {
           unit_price = tierPrice > 0 ? tierPrice : product.normal_price
           unit_cost = 0
         } else {
+          // Off-catalogue line: the price comes from the client, so it is the one
+          // number here nobody has verified. Cap it and require a real name.
+          if (!n.name) {
+            throw Object.assign(new Error('Custom lines need a name'), { status: 400 })
+          }
+          if (n.clientPrice <= 0) {
+            throw Object.assign(
+              new Error(`"${n.name}" needs a price greater than 0`),
+              { status: 400 }
+            )
+          }
+          if (n.clientPrice > OFF_CATALOGUE_PRICE_CAP) {
+            throw Object.assign(
+              new Error(`Off-catalogue lines are capped at ${OFF_CATALOGUE_PRICE_CAP} — add "${n.name}" to the catalogue instead`),
+              { status: 400 }
+            )
+          }
           unit_price = n.clientPrice
         }
 
@@ -1194,24 +1236,60 @@ exports.createOtcSale = async (req, res) => {
 
       const total = subtotal - disc
 
-      // ── Validate payments ────────────────────────────────────────────────
       const { hasCredit } = validatePaymentLines(payments, total)
 
       if (hasCredit && (!customer_phone?.trim() || customer_name === 'Walk-in Customer')) {
         throw Object.assign(new Error('Credit sales require a customer name and phone'), { status: 400 })
       }
 
-      // ── Upsert customer if credit ────────────────────────────────────────
+      // ── Upsert customer and check their credit headroom ──────────────────
       let customer = null
       if (hasCredit) {
+        const phone = customer_phone.trim()
+
         customer = await tx.pharmacyCustomer.upsert({
-          where: { phone: customer_phone.trim() },
+          where: { phone },
           update: {},
-          create: {
-            name: customer_name.trim(),
-            phone: customer_phone.trim(),
-          },
+          create: { name: customer_name.trim(), phone },
         })
+
+        // Serialize on this customer so two concurrent credit sales can't both
+        // read the same balance and both pass the limit check.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('customer:' || ${customer.id}::text))`
+
+        const creditPortion = payments
+          .filter((p) => p.method === 'credit')
+          .reduce((s, p) => s + p.amount, 0)
+
+        const [extended, repaid] = await Promise.all([
+          tx.otcSalePayment.aggregate({
+            where: { method: 'credit', sale: { customer_id: customer.id } },
+            _sum: { amount: true },
+          }),
+          tx.customerPayment.aggregate({
+            where: { customer_id: customer.id },
+            _sum: { amount: true },
+          }),
+        ])
+
+        const balance = (extended._sum.amount ?? 0) - (repaid._sum.amount ?? 0)
+        const headroom = customer.credit_limit - balance
+
+        if (customer.credit_limit <= 0) {
+          throw Object.assign(
+            new Error(`${customer.name} has no credit limit set — an admin must approve one first`),
+            { status: 403 }
+          )
+        }
+        if (creditPortion > headroom) {
+          throw Object.assign(
+            new Error(
+              `Credit limit exceeded. ${customer.name} owes ${balance} of ${customer.credit_limit} — ` +
+              `only ${Math.max(0, headroom)} available, ${creditPortion} requested`
+            ),
+            { status: 409 }
+          )
+        }
       }
 
       const displayMethod = hasCredit ? 'credit' : (payments[0]?.method || 'cash')
@@ -1300,11 +1378,18 @@ exports.createOtcSale = async (req, res) => {
       })
     }, { timeout: 15000 })
 
+    const customLines = sale.items.filter((i) => i.product_id == null)
+
     await writeAuditLog({
       staffId: currentUser?.id,
       user: currentUser?.username,
       action: 'otc_sale',
-      description: `OTC sale ${sale.receipt_number} — ${sale.items.length} line(s), total ${sale.total}`,
+      description:
+        `OTC sale ${sale.receipt_number} — ${sale.items.length} line(s), total ${sale.total}` +
+        (sale.discount_amount > 0 ? `, discount ${sale.discount_amount}` : '') +
+        (customLines.length
+          ? ` — ${customLines.length} off-catalogue line(s): ${customLines.map((i) => `${i.name} @ ${i.unit_price}`).join(', ')}`
+          : ''),
       category: 'sale',
       entity: 'otc_sale',
       entityId: sale.id,
@@ -1322,25 +1407,328 @@ exports.createOtcSale = async (req, res) => {
   }
 }
 
+// ─── Returns ─────────────────────────────────────────────────────────────────
+
+const RETURN_WINDOW_DAYS = 7
+
+function sameCalendarDay(a, b) {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  )
+}
+
+// POST /api/pharmacy/otc-sales/:id/return
+exports.createSaleReturn = async (req, res) => {
+  const saleId = parseInt(req.params.id)
+  const currentUser = req.user
+  const { reason, lines, reference } = req.body
+
+  if (!Number.isInteger(saleId)) {
+    return res.status(400).json({ error: 'Sale ID is required' })
+  }
+
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      // Lock the sale so two returns can't both pass the quantity check.
+      await tx.$executeRaw`SELECT id FROM otc_sales WHERE id = ${saleId} FOR UPDATE`
+
+      const sale = await tx.otcSale.findUnique({
+        where: { id: saleId },
+        include: {
+          items: true,
+          payments: true,
+          customer: { select: { id: true, name: true } },
+          returns: { include: { items: true } },
+        },
+      })
+      if (!sale) throw Object.assign(new Error('Sale not found'), { status: 404 })
+
+      // ── Window ────────────────────────────────────────────────────────────
+      const now = new Date()
+      const soldAt = new Date(sale.sold_at)
+      const ageDays = Math.floor((now - soldAt) / 86400000)
+      const isAdmin = currentUser?.role === 'admin'
+
+      if (!isAdmin && !sameCalendarDay(now, soldAt)) {
+        throw Object.assign(
+          new Error('Pharmacists can only process returns on the day of sale — an admin must handle this one'),
+          { status: 403 }
+        )
+      }
+      if (ageDays > RETURN_WINDOW_DAYS) {
+        throw Object.assign(
+          new Error(`This sale is ${ageDays} days old — returns close after ${RETURN_WINDOW_DAYS} days`),
+          { status: 403 }
+        )
+      }
+
+      // ── Validate the requested lines against what's left ──────────────────
+      const itemById = new Map(sale.items.map((i) => [i.id, i]))
+
+      const alreadyReturned = new Map()
+      for (const r of sale.returns) {
+        for (const ri of r.items) {
+          alreadyReturned.set(ri.sale_item_id, (alreadyReturned.get(ri.sale_item_id) || 0) + ri.quantity)
+        }
+      }
+
+      let refundTotal = 0
+      const planned = []
+
+      for (const l of lines) {
+        const item = itemById.get(l.sale_item_id)
+        if (!item) {
+          throw Object.assign(
+            new Error(`Line ${l.sale_item_id} does not belong to this sale`),
+            { status: 400 }
+          )
+        }
+        const returnable = item.quantity - (alreadyReturned.get(item.id) || 0)
+        if (l.quantity > returnable) {
+          throw Object.assign(
+            new Error(
+              returnable === 0
+                ? `${item.name} has already been fully returned`
+                : `Only ${returnable} of ${item.name} left to return`
+            ),
+            { status: 409 }
+          )
+        }
+        refundTotal += item.unit_price * l.quantity
+        planned.push({ item, quantity: l.quantity, disposition: l.disposition, note: l.note ?? null })
+      }
+
+      if (planned.length === 0) {
+        throw Object.assign(new Error('Select at least one line to return'), { status: 400 })
+      }
+
+      // A discount was applied to the sale as a whole, so a returned line is
+      // worth its share of the discounted total, not its full list price.
+      const grossSubtotal = sale.subtotal || 0
+      if (sale.discount_amount > 0 && grossSubtotal > 0) {
+        refundTotal = Math.round(refundTotal * (sale.total / grossSubtotal))
+      }
+
+      // ── Split the refund: outstanding credit first, then cash ─────────────
+      // You don't hand notes to someone who still owes you for this sale.
+      const creditOnSale = sale.payments
+        .filter((p) => p.method === 'credit')
+        .reduce((s, p) => s + p.amount, 0)
+
+            const alreadyCreditNoted = sale.returns.reduce((s, r) => s + r.credit_note_amount, 0)
+
+      const creditRemaining = Math.max(0, creditOnSale - alreadyCreditNoted)
+      const creditNoteAmount = Math.min(refundTotal, creditRemaining)
+      const cashAmount = refundTotal - creditNoteAmount
+
+      // ── Record the return ─────────────────────────────────────────────────
+      const created = await tx.otcSaleReturn.create({
+        data: {
+          return_number: `RTN-TMP-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+          sale_id: saleId,
+                    reason: reason.trim(),
+          cash_refund_amount: cashAmount,
+          credit_note_amount: creditNoteAmount,
+          reference: reference?.trim() || null,
+          returned_by_id: currentUser?.id ?? null,
+          returned_by: currentUser?.username ?? null,
+        },
+      })
+
+      // ── Stock: restock goes back to its original batch, writeoff doesn't ──
+      for (const p of planned) {
+        if (p.item.product_id == null) continue
+
+        if (p.disposition === 'restock') {
+          await giveStock(tx, {
+            productId: p.item.product_id,
+            batch_id: p.item.product_batch_id ?? null,
+            quantity: p.quantity,
+            reason: 'return_to_stock',
+            refType: 'otc_sale_return',
+            refId: created.id,
+            staffId: currentUser?.id,
+            note: `Returned from ${sale.receipt_number}`,
+          })
+        } else {
+          // Goods left inventory at sale time and are not coming back. Record
+          // the write-off so the loss is visible; stock is unchanged.
+          const product = await tx.product.findUnique({
+            where: { id: p.item.product_id },
+            select: { current_stock: true },
+          })
+          await tx.stockMovement.create({
+            data: {
+              product_id: p.item.product_id,
+              batch_id: p.item.product_batch_id ?? null,
+              delta: 0,
+              reason: 'writeoff',
+              ref_type: 'otc_sale_return',
+              ref_id: created.id,
+              balance_after: product?.current_stock ?? 0,
+              note: `${p.quantity} × ${p.item.name} returned unsaleable from ${sale.receipt_number}${p.note ? ` — ${p.note}` : ''}`,
+              staff_id: currentUser?.id ?? null,
+            },
+          })
+        }
+      }
+
+      await tx.otcSaleReturnItem.createMany({
+        data: planned.map((p) => ({
+          return_id: created.id,
+          sale_item_id: p.item.id,
+          quantity: p.quantity,
+          unit_price: p.item.unit_price,
+          disposition: p.disposition,
+          note: p.note,
+        })),
+      })
+
+      // ── Credit note: reduces the customer's debt, no money moves ──────────
+      if (creditNoteAmount > 0) {
+        if (!sale.customer_id) {
+          throw Object.assign(
+            new Error('This sale has a credit portion but no linked customer — cannot issue a credit note'),
+            { status: 422 }
+          )
+        }
+        await tx.customerPayment.create({
+          data: {
+            customer_id: sale.customer_id,
+            amount: creditNoteAmount,
+            method: 'credit_note',
+            reference: `Return ${created.id} against ${sale.receipt_number}`,
+            staff_id: currentUser?.id ?? null,
+            is_credit_note: true,
+          },
+        })
+      }
+
+      const finalised = await tx.otcSaleReturn.update({
+        where: { id: created.id },
+        data: { return_number: `RTN-${String(created.id).padStart(5, '0')}` },
+        include: { items: true },
+      })
+
+      return { sale, ret: finalised, planned, refundTotal, creditNoteAmount, cashAmount }
+    }, { timeout: 15000 })
+
+    await writeAuditLog({
+      staffId: currentUser?.id,
+      user: currentUser?.username,
+      action: 'otc_return',
+      description:
+        `Return ${result.ret.return_number} against ${result.sale.receipt_number} — ` +
+        `${result.planned.map((p) => `${p.quantity} × ${p.item.name} (${p.disposition})`).join(', ')}. ` +
+        `Refund ${result.refundTotal}` +
+        (result.creditNoteAmount > 0 ? `: ${result.creditNoteAmount} credit note` : '') +
+        (result.cashAmount > 0 ? `${result.creditNoteAmount > 0 ? ' + ' : ': '}${result.cashAmount} cash` : '') +
+        `. Reason: ${result.ret.reason}`,
+      category: 'sale',
+      entity: 'otc_sale_return',
+      entityId: result.ret.id,
+      ipAddress: req.ip ?? null,
+    })
+
+    emit('sale:returned', { saleId, returnId: result.ret.id }, 'admin')
+
+    return res.status(201).json({
+      success: true,
+      return: {
+        id: result.ret.id,
+        return_number: result.ret.return_number,
+                refund_amount: result.refundTotal,
+        credit_note_amount: result.creditNoteAmount,
+        cash_refund_amount: result.cashAmount,
+        reason: result.ret.reason,
+        created_at: result.ret.created_at,
+      },
+    })
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message })
+    console.error('createSaleReturn', err)
+    return res.status(500).json({ error: 'Failed to process return' })
+  }
+}
+
 
 
 // ─── GET OTC SALES (update your include) ──────────────────────────────────────
-
 exports.getOtcSales = async (req, res) => {
   try {
+    const {
+      q,
+      from,
+      to,
+      payment_method,
+      page = '1',
+      limit = '20',
+    } = req.query
+    const pageNum = Math.max(1, parseInt(page) || 1)
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit) || 20))
+    const skip = (pageNum - 1) * limitNum
+
+    const where = {}
+
+    if (from || to) {
+      const range = {}
+      if (from) {
+        const start = new Date(from)
+        if (Number.isNaN(start.getTime())) {
+          return res.status(400).json({ error: 'Invalid from date' })
+        }
+        start.setHours(0, 0, 0, 0)
+        range.gte = start
+      }
+      if (to) {
+        const end = new Date(to)
+        if (Number.isNaN(end.getTime())) {
+          return res.status(400).json({ error: 'Invalid to date' })
+        }
+        end.setHours(0, 0, 0, 0)
+        end.setDate(end.getDate() + 1)   // exclusive upper bound
+        range.lt = end
+      }
+      where.sold_at = range
+    }
+
+    // Filter on the payment lines, not OtcSale.payment_method — that scalar
+    // reads 'credit' for any split sale containing a credit portion.
+    if (payment_method && payment_method !== 'all') {
+      where.payments = { some: { method: payment_method } }
+    }
+
+    const term = typeof q === 'string' ? q.trim() : ''
+    if (term) {
+      where.OR = [
+        { receipt_number: { contains: term, mode: 'insensitive' } },
+        { customer_name: { contains: term, mode: 'insensitive' } },
+        { customer: { phone: { contains: term, mode: 'insensitive' } } },
+        { items: { some: { name: { contains: term, mode: 'insensitive' } } } },
+      ]
+    }
+
     const todayStart = new Date(new Date().setHours(0, 0, 0, 0))
 
-    const [sales, totalAgg, todayAgg] = await Promise.all([
+    const [sales, total, totalAgg, todayAgg] = await Promise.all([
       prisma.otcSale.findMany({
-        include: {
+        where,
+        skip,
+        take: limitNum,
+        orderBy: { sold_at: 'desc' },
+                include: {
           items: { include: { product: { select: { category: true, unit: true } } } },
           sold_by_staff: { select: { username: true } },
-          payments: true,                          // NEW
-          customer: { select: { id: true, name: true, phone: true } }, // NEW
+          payments: true,
+          customer: { select: { id: true, name: true, phone: true } },
+          returns: { include: { items: true } },
         },
-        orderBy: { sold_at: 'desc' },
-        take: 100,
       }),
+      prisma.otcSale.count({ where }),
+      // Stats are all-time, independent of the filter — they describe the
+      // business, not the current search.
       prisma.otcSale.aggregate({ _sum: { total: true }, _count: true }),
       prisma.otcSale.aggregate({
         where: { sold_at: { gte: todayStart } },
@@ -1349,10 +1737,12 @@ exports.getOtcSales = async (req, res) => {
       }),
     ])
 
-    const shaped = sales.map(shapeSale)
-
-    res.json({
-      sales: shaped,
+    return res.json({
+      sales: sales.map(shapeSale),
+      total,
+      page: pageNum,
+      limit: limitNum,
+      pages: Math.max(1, Math.ceil(total / limitNum)),
       stats: {
         total_sales: totalAgg._count,
         total_revenue: totalAgg._sum.total || 0,
@@ -1362,7 +1752,7 @@ exports.getOtcSales = async (req, res) => {
     })
   } catch (err) {
     console.error('getOtcSales', err.message)
-    res.status(500).json({ error: 'Failed to fetch OTC sales' })
+    return res.status(500).json({ error: 'Failed to fetch OTC sales' })
   }
 }
 
@@ -1407,8 +1797,8 @@ exports.createInternalOrder = async (req, res) => {
   }
   const department = ROLE_TO_DEPT[currentUser?.role]
   if (!department || !ORDER_DEPARTMENTS.includes(department)) {
-  return res.status(403).json({ error: 'Your role cannot create supply orders' })
-}
+    return res.status(403).json({ error: 'Your role cannot create supply orders' })
+  }
 
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'Add at least one item to the order' })
@@ -1771,15 +2161,51 @@ exports.getCustomers = async (req, res) => {
         { phone: { contains: term, mode: 'insensitive' } },
       ]
     }
+
     const customers = await prisma.pharmacyCustomer.findMany({
       where,
       orderBy: { created_at: 'desc' },
       take: 20,
+      select: { id: true, name: true, phone: true, credit_limit: true },
     })
-    res.json({ customers })
+
+    if (customers.length === 0) return res.json({ customers: [] })
+
+    const ids = customers.map((c) => c.id)
+
+    // Balance is derived: credit extended minus repayments. Credit lines are
+    // never mutated when a customer pays.
+    const [creditRows, paymentRows] = await Promise.all([
+      prisma.$queryRaw`
+        SELECT s.customer_id, SUM(sp.amount)::int AS total_credit
+        FROM otc_sale_payments sp
+        JOIN otc_sales s ON s.id = sp.sale_id
+        WHERE sp.method = 'credit' AND s.customer_id = ANY(${ids})
+        GROUP BY s.customer_id
+      `,
+      prisma.customerPayment.groupBy({
+        by: ['customer_id'],
+        where: { customer_id: { in: ids } },
+        _sum: { amount: true },
+      }),
+    ])
+
+    const creditById = new Map(creditRows.map((r) => [r.customer_id, r.total_credit]))
+    const paidById = new Map(paymentRows.map((p) => [p.customer_id, p._sum.amount ?? 0]))
+
+    return res.json({
+      customers: customers.map((c) => {
+        const balance = Math.max(0, (creditById.get(c.id) ?? 0) - (paidById.get(c.id) ?? 0))
+        return {
+          ...c,
+          balance,
+          headroom: Math.max(0, c.credit_limit - balance),
+        }
+      }),
+    })
   } catch (err) {
     console.error('getCustomers', err.message)
-    res.status(500).json({ error: 'Failed to fetch customers' })
+    return res.status(500).json({ error: 'Failed to fetch customers' })
   }
 }
 

@@ -47,8 +47,13 @@ router.patch('/prescription-items/:id/confirm-restock',
 
 // ─── OTC sales ────────────────────────────────────────────────────────────────
 
-router.get('/otc-sales', PHARMACY, c.getOtcSales)
+router.get('/otc-sales', PHARMACY, validate({ query: schemas.getOtcSalesQuerySchema }), c.getOtcSales)
 router.post('/otc-sales', PHARMACY, validate({ body: schemas.createOtcSaleSchema }), c.createOtcSale)
+router.post('/otc-sales/:id/return',
+  PHARMACY,
+  validate({ params: schemas.idParamSchema, body: schemas.createSaleReturnSchema }),
+  c.createSaleReturn
+)
 
 // ─── Internal supply orders ───────────────────────────────────────────────────
 

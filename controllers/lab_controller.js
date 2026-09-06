@@ -2,7 +2,7 @@
 const prisma = require('../lib/prisma')
 const { getIO } = require('../utils/socket')
 const pharmacy = require('./pharmacy_controller')
-const { createNotification, NOTIFICATION_TYPES } = require('../utils/helpers')
+const { createNotification, NOTIFICATION_TYPES, writeAuditLog } = require('../utils/helpers')
 
 const MEDICATION = pharmacy.MEDICATION
 
@@ -24,10 +24,9 @@ function shapeRequest(r) {
     // Patient info joined from visit → patient
     patient_name: r.visit?.patient?.name ?? null,
     patient_age: r.visit?.patient?.age ?? null,
-    age_unit: r.visit?.patient?.age_unit ?? 'Year',
+    age_unit: r.visit?.patient?.age_unit ?? 'years',
     patient_gender: r.visit?.patient?.gender ?? null,
     blood_group: r.visit?.patient?.blood_group ?? null,
-    allergies: r.visit?.patient?.allergies ?? null,
     items: (r.items ?? []).map((it) => ({
       id: it.id,
       test_name: it.test_name,
@@ -35,16 +34,12 @@ function shapeRequest(r) {
       reference_range: it.reference_range ?? null,
       unit_cost: it.unit_cost,
       result: it.result ?? null,
-      // ADDED: structured result fields from the schema
       result_data: it.result_data ?? null,
+      applied_ranges: it.applied_ranges ?? null,
       result_notes: it.result_notes ?? null,
       flagged: it.flagged ?? false,
       status: it.status,
       completed_at: it.completed_at ?? null,
-      // ADDED: persisted consumable usage — seeds the ResultsModal's Stock Used
-      // rows so reopening the modal shows what was already deducted, and the
-      // diff on the next save stays idempotent. quantity_deducted lets the UI
-      // compute true availability (shelf count + what this row already took).
       stock_used: (it.stock_usages ?? []).map((u) => ({
         id: u.id,
         stock_item_id: u.stock_item_id,
@@ -81,10 +76,10 @@ const REQUEST_INCLUDE = {
           id: true,
           name: true,
           age: true,
+          age_unit: true,
           gender: true,
           phone: true,
           blood_group: true,
-          allergies: true,
         },
       }
     },
@@ -111,7 +106,7 @@ const REQUEST_INCLUDE = {
 }
 
 const RESTOCK_INCLUDE = {
-  labStock: {
+  lab_stock: {
     select: { id: true, name: true, current_stock: true, category: true },
   },
 }
@@ -232,12 +227,12 @@ exports.getSupplies = async (req, res) => {
         is_active: true,
         ...(q
           ? {
-              OR: [
-                { name: { contains: q, mode: 'insensitive' } },
-                { sub_category: { contains: q, mode: 'insensitive' } },
-                { sku: { contains: q, mode: 'insensitive' } },
-              ],
-            }
+            OR: [
+              { name: { contains: q, mode: 'insensitive' } },
+              { sub_category: { contains: q, mode: 'insensitive' } },
+              { sku: { contains: q, mode: 'insensitive' } },
+            ],
+          }
           : {}),
       },
       orderBy: [{ category: 'asc' }, { name: 'asc' }],
@@ -450,6 +445,7 @@ exports.updateRequestStatus = async (req, res) => {
           data: {
             result: it.result ?? null,
             result_data: it.result_data ?? null,
+            applied_ranges: it.applied_ranges ?? undefined,
             result_notes: it.result_notes ?? null,
             flagged: !!it.flagged,
             status: itemReady ? 'ready' : 'in_progress',
@@ -592,7 +588,7 @@ exports.getLabTestCatalog = async (req, res) => {
 
     const tests = await prisma.labTestCatalog.findMany({
       where,
-      select: { id: true, name: true, category: true, reference_range: true, unit_cost: true },
+      select: { id: true, name: true, category: true, reference_range: true, unit_cost: true, result_template: true },
       orderBy: [{ category: 'asc' }, { name: 'asc' }],
     })
 
@@ -614,22 +610,6 @@ exports.getStock = async (req, res) => {
   } catch (err) {
     console.error('getStock', err)
     res.status(500).json({ error: 'Failed to fetch stock' })
-  }
-}
-
-// ─── Pharmacy supply orders (PharmacyOrdersTab) ───────────────────────────────
-
-exports.getLabOrders = async (req, res) => {
-  try {
-    const orders = await prisma.pharmacyOrder.findMany({
-      where: { department: 'lab' },
-      include: { items: true },
-      orderBy: { requested_at: 'desc' },
-    })
-    res.json({ orders })
-  } catch (err) {
-    console.error('getLabOrders', err)
-    res.status(500).json({ error: 'Failed to fetch orders' })
   }
 }
 
@@ -666,8 +646,8 @@ exports.createRestockRequest = async (req, res) => {
     const product = await prisma.labStock.findUnique({ where: { id: productId } })
     if (!product) return res.status(404).json({ error: 'Product not found' })
 
-    const existing = await prisma.restockRequest.findFirst({
-      where: { department: 'lab', product_id: productId, status: 'pending' },
+       const existing = await prisma.restockRequest.findFirst({
+      where: { department: 'lab', lab_stock_id: productId, status: 'pending' },
     })
     if (existing) {
       return res.status(409).json({
@@ -686,7 +666,7 @@ exports.createRestockRequest = async (req, res) => {
         notes: (typeof notes === 'string' && notes.trim()) || null,
         status: 'pending',
         requested_by: currentUser?.username ?? 'unknown',
-        requested_by_id: currentUser?.id ?? null,  
+        requested_by_id: currentUser?.id ?? null,
       },
       include: RESTOCK_INCLUDE,
     })
@@ -697,16 +677,16 @@ exports.createRestockRequest = async (req, res) => {
       message: `${currentUser?.username ?? 'Pharmacy'} requested ${qty} ${product.unit} of ${product.name} (current stock: ${product.current_stock}).`,
     })
 
-      await writeAuditLog({
-        staffId: currentUser?.id,   // ✅ fixed
-        user: currentUser?.username,
-        action: 'request_restock',
-        description: `Requested ${qty} ${product.unit} of ${product.name}${batch ? ` (batch ${batch})` : ''}`,
-        category: 'stock',
-        entity: 'restock_request',
-        entityId: created.id,
-        ipAddress: req.ip ?? null,
-      })
+    await writeAuditLog({
+      staffId: currentUser?.id,   
+      user: currentUser?.username,
+      action: 'request_restock',
+      description: `Requested ${qty} ${product.unit} of ${product.name}`,
+      category: 'stock',
+      entity: 'restock_request',
+      entityId: created.id,
+      ipAddress: req.ip ?? null,
+    })
 
     return res.status(201).json({ success: true })
 

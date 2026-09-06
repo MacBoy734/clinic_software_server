@@ -52,7 +52,7 @@ router.post('/pharmacy/customer-payments', c.collectCustomerPayment)
 // POST routes
 router.post('/referrals', c.createReferral)
 router.post('/charge-templates', c.createChargeTemplate)
-router.post('/drug-stock', c.createDrugStockItem)
+router.post('/drug-stock', c.createStockItem)
 router.post('/staff', c.addStaffPost)
 router.post('/lab-stock', c.createLabStockItem)
 
@@ -71,7 +71,7 @@ router.patch('/staff/:id/password', c.resetStaffPassword)
 
 // PUT routes
 router.put('/drug-stock/:id', c.updateDrugStockItem)
-router.put('/drug-stock/:id/quantity', c.updateDrugStockQuantity)
+router.put('/drug-stock/:id/quantity', c.updateStockItemQuantity)
 router.put('/lab-stock/:id', c.updateLabStockItem)
 
 // DELETE routes

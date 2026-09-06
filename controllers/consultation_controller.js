@@ -17,7 +17,7 @@ function shapeVisit(v) {
     patient_id: v.patient_id,
     patient_name: v.patient?.name ?? null,
     patient_age: v.patient?.age ?? null,
-    patient_age_unit: v.patient?.age_unit ?? 'Years',
+    patient_age_unit: v.patient?.age_unit ?? 'years',
     patient_gender: v.patient?.gender ?? null,
     blood_group: v.patient?.blood_group ?? null,
     allergies: v.patient?.allergies ?? null,
@@ -70,6 +70,7 @@ function shapeLabRequest(r) {
       reference_range: it.reference_range ?? null,
       unit_cost: it.unit_cost,
       result: it.result ?? null,
+      applied_ranges: it.applied_ranges ?? null,
       result_data: it.result_data ?? null,
       result_notes: it.result_notes ?? null,
       flagged: it.flagged ?? false,
@@ -527,7 +528,7 @@ exports.getDoctorOrders = async (req, res) => {
 
 exports.getLabRequests = async (req, res) => {
   try {
-    const visitId = req.params.id   // already coerced by validate({ params })
+    const visitId = req.params.id  
 
     const requests = await prisma.labRequest.findMany({
       where: { visit_id: visitId },
@@ -536,7 +537,7 @@ exports.getLabRequests = async (req, res) => {
     })
     res.json({ requests: requests.map(shapeLabRequest) })
   } catch (err) {
-    console.error('getLabRequests', err)
+    console.error('getLabRequests', err.message)
     res.status(500).json({ error: 'Failed to fetch lab requests' })
   }
 }

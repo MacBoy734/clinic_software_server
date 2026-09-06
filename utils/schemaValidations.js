@@ -27,18 +27,17 @@ const Address = z.string().trim().max(500).nullable().optional()
 
 const RoleEnum = z.enum(['admin', 'doctor', 'receptionist', 'lab_tech', 'pharmacist'])
 const VisitTypeEnum = z.enum(['consultation', 'injection', 'family_planning', 'direct_lab'])
-const VisitStatusEnum = z.enum(['waiting', 'consultation_paid', 'with_doctor', 'lab', 'pharmacy', 'billing', 'done', 'archived'])
+const VisitStatusEnum = z.enum(['waiting', 'consultation_paid', 'with_doctor', 'lab', 'pharmacy', 'billing', 'done', 'partially_paid', 'archived'])
 // NOTE: 'waiver' removed — it is a FeeStatus, NOT a PaymentMethod in Prisma.
 const PaymentMethodEnum = z.enum(['cash', 'mpesa', 'insurance', 'other', 'credit'])
-const ChargeCategoryEnum = z.enum(['consultation', 'procedure', 'lab', 'medication', 'family_planning'])
+const ChargeCategoryEnum = z.enum(['lab'])
 const ProductCategoryEnum = z.enum(['medication', 'consumable', 'general'])
 // NOTE: 'declined' removed — it exists ONLY on PrescriptionItemStatus, not PrescriptionStatus.
-const PrescriptionStatusEnum = z.enum(['pending', 'issued', 'dispensed', 'returned', 'cancelled'])
+const PrescriptionStatusEnum = z.enum(['pending', 'issued', 'returned', 'cancelled'])
 const PrescriptionItemStatusEnum = z.enum(['pending', 'issued', 'declined', 'returned', 'restocked', 'cancelled'])
 const LabRequestStatusEnum = z.enum(['pending', 'in_progress', 'ready'])
 const LabItemStatusEnum = z.enum(['pending', 'in_progress', 'ready'])
 const ExpenseDomainEnum = z.enum(['clinic', 'pharmacy'])
-// NOTE: 'reception' added to match Prisma OrderDepartment enum.
 const OrderDepartmentEnum = z.enum(['doctor', 'lab'])
 const OrderStatusEnum = z.enum(['pending', 'fulfilled', 'cancelled'])
 const RestockStatusEnum = z.enum(['pending', 'approved', 'rejected'])
@@ -441,6 +440,15 @@ const createOtcSaleSchema = z.object({
   discount_reason: z.string().trim().min(1).nullable().optional(),
 }).refine((data) => !(data.discount_amount > 0 && !data.discount_reason), { message: 'A reason is required for every discount' })
 
+const getOtcSalesQuerySchema = z.object({
+  q: z.string().trim().max(100).optional(),
+  from: z.string().trim().optional(),
+  to: z.string().trim().optional(),
+  payment_method: z.enum(['all', 'cash', 'mpesa', 'credit', 'other']).optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+})
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // PHARMACY — ORDERS & RESTOCK
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -475,6 +483,20 @@ const createRestockRequestSchema = z.object({
   expiry_date: FutureDate.nullable().optional(),
   notes: NullableString,
 }).refine((data) => data.product_id || data.drug_stock_id, { message: 'product_id or drug_stock_id is required' })
+
+const saleReturnLineSchema = z.object({
+  sale_item_id: IdParam,
+  quantity: PositiveQuantity,
+  disposition: z.enum(['restock', 'writeoff']),
+  note: z.string().trim().max(500).nullable().optional(),
+})
+
+const createSaleReturnSchema = z.object({
+  reason: z.string().trim().min(3, 'A reason is required'),
+  refund_method: z.enum(['cash', 'mpesa', 'credit_note']).default('cash'),
+  reference: z.string().trim().max(100).nullable().optional(),
+  lines: z.array(saleReturnLineSchema).min(1, 'Select at least one line'),
+})
 
 const collectCustomerPaymentSchema = z.object({
   customer_id: IdParam,
@@ -598,7 +620,7 @@ module.exports = {
 
   // Pharmacy
   prescriptionItemSchema,rejectItemRestockSchema,  createPrescriptionSchema, returnItemSchema, returnPrescriptionSchema,
-  verifyPrescriptionSchema, otcSaleItemSchema, createOtcSaleSchema,
+  verifyPrescriptionSchema, otcSaleItemSchema, createOtcSaleSchema, getOtcSalesQuerySchema, createSaleReturnSchema, 
   orderItemSchema, createInternalOrderSchema, fulfillOrderSchema, cancelOrderSchema,
   createRestockRequestSchema, collectCustomerPaymentSchema,
 

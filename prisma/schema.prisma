@@ -68,6 +68,11 @@ enum LabStatus {
   ready
 }
 
+enum ReturnLineDisposition {
+  restock    
+  writeoff   
+}
+
 enum RestockStatus {
   pending
   approved
@@ -165,6 +170,7 @@ model Staff {
 
   orders_requested PharmacyOrder[] @relation("OrderRequestedBy")
   orders_fulfilled PharmacyOrder[] @relation("OrderFulfilledBy")
+  returns_processed OtcSaleReturn[] @relation("ReturnsProcessed")
   stock_movements  StockMovement[]
 
   @@map("staff")
@@ -306,6 +312,10 @@ model LabRequestItem {
   unit_cost       Int       @default(0)
   result          String?
   result_data     Json?
+  applied_ranges Json?
+  result_numeric Float?     
+  quantity       Int  @default(1)  
+  unit           String? 
   result_notes    String?
   flagged         Boolean   @default(false)
   status          LabStatus @default(pending)
@@ -590,13 +600,14 @@ model OtcSale {
   discount_reason String?
   discount_by     String?
 
-
+  returns OtcSaleReturn[]
   customer      PharmacyCustomer? @relation(fields: [customer_id], references: [id])
   sold_by_staff Staff?        @relation("OtcSoldBy", fields: [sold_by_id], references: [id])
   items         OtcSaleItem[]
   payments      OtcSalePayment[]
 
   @@index([sold_at])
+  @@index([customer_id])
   @@map("otc_sales")
 }
 
@@ -612,6 +623,7 @@ model OtcSaleItem {
   price_tier String @default("normal")
   product_batch_id Int?
 
+  return_items OtcSaleReturnItem[]
   sale    OtcSale  @relation(fields: [sale_id], references: [id], onDelete: Cascade)
   product_batch    ProductBatch? @relation(fields: [product_batch_id], references: [id], onDelete: SetNull)
   product Product? @relation(fields: [product_id], references: [id], onDelete: SetNull)
@@ -624,6 +636,7 @@ model PharmacyCustomer {
   id         Int      @id @default(autoincrement())
   name       String
   phone      String?  @unique
+  credit_limit Int   @default(5000)
   created_at DateTime @default(now())
 
   sales     OtcSale[]
@@ -644,7 +657,47 @@ model OtcSalePayment {
   sale OtcSale @relation(fields: [sale_id], references: [id], onDelete: Cascade)
 
   @@index([sale_id])
+  @@index([method, created_at])
+  @@index([created_at])
   @@map("otc_sale_payments")
+}
+
+model OtcSaleReturn {
+  id               Int           @id @default(autoincrement())
+  return_number    String        @unique
+  sale_id          Int
+    reason             String
+  cash_refund_amount Int         @default(0)
+  credit_note_amount Int         @default(0)
+  reference          String?
+  returned_by_id   Int?
+  returned_by      String?
+  created_at       DateTime      @default(now())
+
+  sale        OtcSale             @relation(fields: [sale_id], references: [id])
+  returned_by_staff Staff?        @relation("ReturnsProcessed", fields: [returned_by_id], references: [id], onDelete: SetNull)
+  items       OtcSaleReturnItem[]
+
+  @@index([sale_id])
+  @@index([created_at])
+  @@map("otc_sale_returns")
+}
+
+model OtcSaleReturnItem {
+  id            Int                   @id @default(autoincrement())
+  return_id     Int
+  sale_item_id  Int
+  quantity      Int
+  unit_price    Int                   @default(0) 
+  disposition   ReturnLineDisposition
+  note          String?
+
+  return    OtcSaleReturn @relation(fields: [return_id], references: [id], onDelete: Cascade)
+  sale_item OtcSaleItem   @relation(fields: [sale_item_id], references: [id])
+
+  @@index([return_id])
+  @@index([sale_item_id])
+  @@map("otc_sale_return_items")
 }
 
 
@@ -655,12 +708,14 @@ model CustomerPayment {
   method      String   // cash, mpesa, etc.
   reference   String?
   staff_id    Int?
+  is_credit_note Boolean @default(false)
   created_at  DateTime @default(now())
 
   customer PharmacyCustomer @relation(fields: [customer_id], references: [id])
   staff    Staff?           @relation(fields: [staff_id], references: [id])
 
   @@index([customer_id, created_at])
+  @@index([created_at])
   @@map("customer_payments")
 }
 
@@ -811,6 +866,7 @@ model PharmacyExpense {
 
   recorded_by_staff Staff? @relation(fields: [recorded_by], references: [id])
 
+  @@index([incurred_at])
   @@map("pharmacy_expenses")
 }
 
@@ -867,6 +923,7 @@ model Referral {
   referrer_facility String?
   referrer_phone    String?
   commission_amount Int?
+  amount_paid Int @default(0)
   status            ReferralStatus @default(pending)
   notes             String?
   paid_at           DateTime?
