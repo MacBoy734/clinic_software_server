@@ -226,6 +226,11 @@ const NOTIFICATION_TYPES = {
   ORDER_NEW: 'order_new',
   ORDER_FULFILLED: 'order_fulfilled',
   ORDER_CANCELLED: 'order_cancelled',
+  STOCK_DRIFT: 'stock_drift',
+  STOCKTAKE_SUBMITTED: 'stocktake_submitted',
+  STOCKTAKE_RETURNED: 'stocktake_returned',
+  STOCKTAKE_APPROVED: 'stocktake_approved',
+  STOCK_DRIFT: 'stock_drift',
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

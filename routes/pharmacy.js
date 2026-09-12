@@ -61,5 +61,11 @@ router.get('/orders', REQUESTERS, c.getInternalOrders)
 router.post('/orders', REQUESTERS, validate({ body: schemas.createInternalOrderSchema }), c.createInternalOrder)
 router.patch('/orders/:id/fulfill', PHARMACY, validate({ params: schemas.idParamSchema, body: schemas.fulfillOrderSchema }), c.fulfillOrder)
 router.patch('/orders/:id/cancel', PHARMACY, validate({ params: schemas.idParamSchema, body: schemas.cancelOrderSchema }), c.cancelOrder)
+  
+router.post('/stocktake', PHARMACY, c.createStocktake)
+router.get('/stocktake', PHARMACY, c.getStocktakes)
+router.get('/stocktake/:id', PHARMACY, c.getStocktake)
+router.patch('/stocktake/:id/items/:itemId', PHARMACY, c.recordStocktakeCount)
+router.post('/stocktake/:id/submit', PHARMACY, c.submitStocktake)
 
 module.exports = router

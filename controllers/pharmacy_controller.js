@@ -15,10 +15,25 @@ const SUPPLY_CATEGORIES = CATEGORIES.filter((c) => c !== MEDICATION)
 const PRICE_TIERS = ['normal', 'promotional', 'wholesale']
 const OFF_CATALOGUE_PRICE_CAP = 20000
 const ORDER_DEPARTMENTS = ['doctor', 'lab', 'admin']
+const LOCK = { PRODUCT: 1, CUSTOMER: 2 }
+function lockProduct(tx, productId) {
+  return tx.$executeRaw`SELECT pg_advisory_xact_lock(${LOCK.PRODUCT}::int, ${productId}::int)`
+}
 
 exports.CATEGORIES = CATEGORIES
 exports.MEDICATION = MEDICATION
 exports.SUPPLY_CATEGORIES = SUPPLY_CATEGORIES
+
+const STOCKTAKE_WORKLIST_SIZE = 60
+const STOCKTAKE_MAX_SIZE = 200
+
+const STOCKTAKE_REASONS = [
+  'expired', 'damaged', 'broken', 'stolen',
+  'miscounted', 'misplaced', 'found_unrecorded', 'other',
+]
+
+const httpError = (message, status = 400, meta) =>
+  Object.assign(new Error(message), { status, meta })
 
 
 const TAX_RATES = {
@@ -64,11 +79,10 @@ class ShortfallError extends Error {
 // ─── Stock ledger helpers ────────────────────────────────────────────────────
 
 
-async function takeStock(tx, { productId, quantity, reason, refType, refId, staffId, note }) {
+module.exports.takeStock = async function (tx, { productId, quantity, reason, refType, refId, staffId, note }) {
   if (!productId || !quantity || quantity <= 0) return null
 
-  // Serialize all stock operations on this product
-  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${productId})`
+  await lockProduct(tx, productId)
 
   // Read current state first
   const product = await tx.product.findUnique({
@@ -113,25 +127,13 @@ async function takeStock(tx, { productId, quantity, reason, refType, refId, staf
   const batches_used = []
   let remaining = quantity
 
-  // Legacy fallback: no batch records yet
-  if (batches.length === 0) {
-    await tx.stockMovement.create({
-      data: {
-        product_id: productId,
-        delta: -quantity,
-        reason,
-        ref_type: refType ?? null,
-        ref_id: refId ?? null,
-        balance_after: updatedProduct.current_stock,
-        note: note ?? 'Deduction without batch tracking (legacy stock)',
-        staff_id: staffId ?? null,
-      },
-    })
-    return {
-      balance_after: updatedProduct.current_stock,
-      batches_used: [],
-    }
+   if (batches.length === 0) {
+    throw new Error(
+      `${product.name} has stock (${product.current_stock}) but no batch records — ` +
+      `cannot deduct. Create an opening-balance batch for this product first.`
+    )
   }
+  
 
   // Walk batches oldest-first (FEFO).
   // If oldest doesn't have enough, exhaust it and move to the next oldest.
@@ -188,11 +190,10 @@ async function takeStock(tx, { productId, quantity, reason, refType, refId, staf
   }
 }
 
-async function giveStock(tx, { productId, quantity, batch_id, reason, refType, refId, staffId, note }) {
+module.exports.giveStock = async function (tx, { productId, quantity, batch_id, reason, refType, refId, staffId, note }) {
   if (!productId || !quantity || quantity <= 0) return null
 
-  // Serialize all stock operations on this product
-  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${productId})`
+  await lockProduct(tx, productId)
 
   const product = await tx.product.findUnique({
     where: { id: productId },
@@ -319,6 +320,85 @@ function shapeProduct(p) {
   }
 }
 
+function shapeStocktakeMeta(s) {
+  return {
+    id: s.id,
+    label: s.label,
+    status: s.status,
+    blind: s.blind,
+    started_by: s.started_by,
+    started_at: s.started_at,
+    submitted_by: s.submitted_by ?? null,
+    submitted_at: s.submitted_at ?? null,
+    reviewed_by: s.reviewed_by ?? null,
+    reviewed_at: s.reviewed_at ?? null,
+    review_notes: s.review_notes ?? null,
+  }
+}
+
+
+function shapeStocktakeItem(item, hideSystem) {
+  const base = {
+    id: item.id,
+    product_id: item.product_id,
+    product_name: item.product?.name ?? null,
+    unit: item.product?.unit ?? null,
+    category: item.product?.category ?? null,
+    shelf_location: item.shelf_location ?? null,
+    counted_qty: item.counted_qty,
+    counted_at: item.counted_at,
+    counted_by: item.counted_by ?? null,
+    reason: item.reason ?? null,
+    note: item.note ?? null,
+    posted_at: item.posted_at ?? null,
+  }
+  if (hideSystem) return base
+
+  return {
+    ...base,
+    system_qty: item.system_qty,
+    variance: item.variance,
+    retail_value: item.variance != null
+      ? Math.abs(item.variance) * (item.product?.normal_price ?? 0)
+      : 0,
+  }
+}
+
+function summariseStocktake(items) {
+  const counted = items.filter((i) => i.counted_at != null)
+  const disc = counted.filter((i) => i.variance !== 0)
+  return {
+    total_items: items.length,
+    counted_items: counted.length,
+    uncounted_items: items.length - counted.length,
+    discrepancy_count: disc.length,
+    total_missing: disc.reduce((s, i) => s + Math.min(0, i.variance), 0),
+    total_found: disc.reduce((s, i) => s + Math.max(0, i.variance), 0),
+    retail_value_missing: disc.reduce(
+      (s, i) => s + (i.variance < 0 ? Math.abs(i.variance) * (i.product?.normal_price ?? 0) : 0),
+      0
+    ),
+  }
+}
+
+function stocktakeProgress(items) {
+  const counted = items.filter((i) => i.counted_at != null).length
+  return {
+    total_items: items.length,
+    counted_items: counted,
+    uncounted_items: items.length - counted,
+  }
+}
+
+const STOCKTAKE_INCLUDE = {
+  items: {
+    include: {
+      product: { select: { id: true, name: true, unit: true, category: true, normal_price: true } },
+    },
+    orderBy: [{ shelf_location: 'asc' }, { id: 'asc' }],
+  },
+}
+
 function shapePrescription(p) {
   return {
     id: p.id,
@@ -439,7 +519,7 @@ function shapeSale(s) {
       amount: p.amount,
       reference: p.reference,
     })),
-           returns: (s.returns ?? []).map((r) => ({
+    returns: (s.returns ?? []).map((r) => ({
       id: r.id,
       return_number: r.return_number,
       cash_refund_amount: r.cash_refund_amount,
@@ -1253,9 +1333,7 @@ exports.createOtcSale = async (req, res) => {
           create: { name: customer_name.trim(), phone },
         })
 
-        // Serialize on this customer so two concurrent credit sales can't both
-        // read the same balance and both pass the limit check.
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('customer:' || ${customer.id}::text))`
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${LOCK.CUSTOMER}, ${customer.id})`
 
         const creditPortion = payments
           .filter((p) => p.method === 'credit')
@@ -1517,7 +1595,7 @@ exports.createSaleReturn = async (req, res) => {
         .filter((p) => p.method === 'credit')
         .reduce((s, p) => s + p.amount, 0)
 
-            const alreadyCreditNoted = sale.returns.reduce((s, r) => s + r.credit_note_amount, 0)
+      const alreadyCreditNoted = sale.returns.reduce((s, r) => s + r.credit_note_amount, 0)
 
       const creditRemaining = Math.max(0, creditOnSale - alreadyCreditNoted)
       const creditNoteAmount = Math.min(refundTotal, creditRemaining)
@@ -1528,7 +1606,7 @@ exports.createSaleReturn = async (req, res) => {
         data: {
           return_number: `RTN-TMP-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
           sale_id: saleId,
-                    reason: reason.trim(),
+          reason: reason.trim(),
           cash_refund_amount: cashAmount,
           credit_note_amount: creditNoteAmount,
           reference: reference?.trim() || null,
@@ -1552,25 +1630,26 @@ exports.createSaleReturn = async (req, res) => {
             staffId: currentUser?.id,
             note: `Returned from ${sale.receipt_number}`,
           })
-        } else {
-          // Goods left inventory at sale time and are not coming back. Record
-          // the write-off so the loss is visible; stock is unchanged.
-          const product = await tx.product.findUnique({
-            where: { id: p.item.product_id },
-            select: { current_stock: true },
+                } else {
+          await giveStock(tx, {
+            productId: p.item.product_id,
+            batch_id: p.item.product_batch_id ?? null,
+            quantity: p.quantity,
+            reason: 'return_to_stock',
+            refType: 'otc_sale_return',
+            refId: created.id,
+            staffId: currentUser?.id,
+            note: `Returned unsaleable from ${sale.receipt_number}`,
           })
-          await tx.stockMovement.create({
-            data: {
-              product_id: p.item.product_id,
-              batch_id: p.item.product_batch_id ?? null,
-              delta: 0,
-              reason: 'writeoff',
-              ref_type: 'otc_sale_return',
-              ref_id: created.id,
-              balance_after: product?.current_stock ?? 0,
-              note: `${p.quantity} × ${p.item.name} returned unsaleable from ${sale.receipt_number}${p.note ? ` — ${p.note}` : ''}`,
-              staff_id: currentUser?.id ?? null,
-            },
+
+          await takeStock(tx, {
+            productId: p.item.product_id,
+            quantity: p.quantity,
+            reason: 'writeoff',
+            refType: 'otc_sale_return',
+            refId: created.id,
+            staffId: currentUser?.id,
+            note: `${p.item.name} unsaleable${p.note ? ` — ${p.note}` : ''}`,
           })
         }
       }
@@ -1639,7 +1718,7 @@ exports.createSaleReturn = async (req, res) => {
       return: {
         id: result.ret.id,
         return_number: result.ret.return_number,
-                refund_amount: result.refundTotal,
+        refund_amount: result.refundTotal,
         credit_note_amount: result.creditNoteAmount,
         cash_refund_amount: result.cashAmount,
         reason: result.ret.reason,
@@ -1718,7 +1797,7 @@ exports.getOtcSales = async (req, res) => {
         skip,
         take: limitNum,
         orderBy: { sold_at: 'desc' },
-                include: {
+        include: {
           items: { include: { product: { select: { category: true, unit: true } } } },
           sold_by_staff: { select: { username: true } },
           payments: true,
@@ -1758,32 +1837,77 @@ exports.getOtcSales = async (req, res) => {
 
 exports.getInternalOrders = async (req, res) => {
   try {
-    const { department, status } = req.query
+    const { department, status, from, to } = req.query
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1)
+
+    // Existing callers that do not supply a limit still receive up to 200 rows.
+    // The admin dashboard supplies limit=20 and uses the pagination fields below.
+    const limit = Math.min(
+      200,
+      Math.max(1, Number.parseInt(req.query.limit, 10) || 200)
+    )
 
     const where = {}
     if (ORDER_DEPARTMENTS.includes(department)) where.department = department
     if (['pending', 'fulfilled', 'cancelled'].includes(status)) where.status = status
 
-    const [orders, pending, fulfilled, cancelled, total] = await Promise.all([
+    // A requested-date range is inclusive of both calendar dates. Keep this
+    // parsing aligned with the existing finance endpoints in admin_controller.
+    if (from || to) {
+      if (!from || !to) {
+        return res.status(400).json({ error: 'Both from and to dates are required' })
+      }
+
+      const start = new Date(from)
+      const end = new Date(to)
+      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
+        return res.status(400).json({ error: 'Invalid requested-date range' })
+      }
+
+      start.setHours(0, 0, 0, 0)
+      end.setHours(0, 0, 0, 0)
+      end.setDate(end.getDate() + 1) // exclusive upper bound; includes the whole "to" date
+      where.requested_at = { gte: start, lt: end }
+    }
+
+    const [orders, total, statusGroups] = await prisma.$transaction([
       prisma.pharmacyOrder.findMany({
         where,
         include: ORDER_INCLUDE,
         orderBy: { requested_at: 'desc' },
-        take: 200,
+        skip: (page - 1) * limit,
+        take: limit,
       }),
-      prisma.pharmacyOrder.count({ where: { status: 'pending' } }),
-      prisma.pharmacyOrder.count({ where: { status: 'fulfilled' } }),
-      prisma.pharmacyOrder.count({ where: { status: 'cancelled' } }),
-      prisma.pharmacyOrder.count(),
+      prisma.pharmacyOrder.count({ where }),
+      // These remain overall counts, so the status chips remain useful even
+      // when the administrator filters to Doctor or Lab requests.
+      prisma.pharmacyOrder.groupBy({
+        by: ['status'],
+        _count: { _all: true },
+      }),
     ])
 
-    res.json({
+    const counts = Object.fromEntries(
+      statusGroups.map((group) => [group.status, group._count._all])
+    )
+    const allOrders = Object.values(counts).reduce((sum, count) => sum + count, 0)
+
+    return res.json({
       orders: orders.map(shapeOrder),
-      stats: { pending, fulfilled, cancelled, total },
+      stats: {
+        pending: counts.pending ?? 0,
+        fulfilled: counts.fulfilled ?? 0,
+        cancelled: counts.cancelled ?? 0,
+        total: allOrders,
+      },
+      total,
+      page,
+      limit,
+      pages: Math.max(1, Math.ceil(total / limit)),
     })
   } catch (err) {
     console.error('getInternalOrders', err.message)
-    res.status(500).json({ error: 'Failed to fetch orders' })
+    return res.status(500).json({ error: 'Failed to fetch orders' })
   }
 }
 
@@ -2238,5 +2362,372 @@ exports.updateShelfLocation = async (req, res) => {
       return res.status(404).json({ error: 'Product not found' })
     }
     res.status(500).json({ error: 'Failed to update shelf location' })
+  }
+}
+
+// ─── Stocktake ───────────────────────────────────────────────────────────────
+
+exports.createStocktake = async (req, res) => {
+  const currentUser = req.user
+  const { label, shelf_from, shelf_to, blind } = req.body || {}
+  const size = Math.min(
+    STOCKTAKE_MAX_SIZE,
+    Math.max(1, parseInt(req.body?.size, 10) || STOCKTAKE_WORKLIST_SIZE)
+  )
+
+  try {
+    const open = await prisma.stocktakeSession.findFirst({
+      where: { status: { in: ['in_progress', 'submitted'] } },
+      select: { id: true, label: true, status: true },
+    })
+    if (open) {
+      return res.status(409).json({
+        error: `"${open.label}" is still ${open.status.replace('_', ' ')} — finish it before starting another`,
+        session_id: open.id,
+      })
+    }
+
+    // Rotating coverage without a classification table: least-recently-counted
+    // first, never-counted first of all. One ORDER BY does what A/B/C tiering
+    // does, with nothing to maintain.
+    const where = { is_active: true }
+    if (shelf_from && shelf_to) {
+      where.shelf_location = { gte: String(shelf_from), lte: String(shelf_to) }
+    }
+
+    const products = await prisma.product.findMany({
+      where,
+      orderBy: [{ last_counted_at: { sort: 'asc', nulls: 'first' } }, { shelf_location: 'asc' }],
+      take: size,
+      select: { id: true, shelf_location: true },
+    })
+    if (products.length === 0) {
+      return res.status(400).json({ error: 'No products match this scope' })
+    }
+
+    const session = await prisma.stocktakeSession.create({
+      data: {
+        label: (typeof label === 'string' && label.trim())
+          || `Count — ${new Date().toISOString().slice(0, 10)}`,
+        blind: blind !== false,
+        started_by: currentUser?.username ?? 'Pharmacist',
+        started_by_id: currentUser?.id ?? null,
+        items: {
+          create: products.map((p) => ({
+            product_id: p.id,
+            shelf_location: p.shelf_location,
+          })),
+        },
+      },
+      include: STOCKTAKE_INCLUDE,
+    })
+
+    await writeAuditLog({
+      staffId: currentUser?.id,
+      user: currentUser?.username,
+      action: 'Stocktake Started',
+      description: `Started "${session.label}" — ${products.length} product(s)${session.blind ? ', blind' : ', UNBLIND'}`,
+      category: 'stock',
+      entity: 'StocktakeSession',
+      entityId: session.id,
+      ipAddress: req.ip ?? null,
+    })
+
+    const hide = session.blind
+    return res.status(201).json({
+      success: true,
+      session: {
+        ...shapeStocktakeMeta(session),
+        items: session.items.map((i) => shapeStocktakeItem(i, hide)),
+        stats: hide ? stocktakeProgress(session.items) : summariseStocktake(session.items),
+      },
+    })
+  } catch (err) {
+    console.error('createStocktake', err.message)
+    return res.status(500).json({ error: 'Failed to start stocktake' })
+  }
+}
+
+exports.getStocktakes = async (req, res) => {
+  try {
+    const sessions = await prisma.stocktakeSession.findMany({
+      orderBy: { started_at: 'desc' },
+      take: 50,
+    })
+    if (sessions.length === 0) return res.json({ sessions: [] })
+
+    const ids = sessions.map((s) => s.id)
+    const stats = await prisma.$queryRaw`
+      SELECT session_id,
+             COUNT(*)::int                                                      AS total_items,
+             COUNT(counted_at)::int                                             AS counted_items,
+             COUNT(*) FILTER (WHERE variance IS NOT NULL AND variance <> 0)::int AS discrepancy_count,
+             COALESCE(SUM(variance) FILTER (WHERE variance < 0), 0)::int         AS total_missing,
+             COALESCE(SUM(variance) FILTER (WHERE variance > 0), 0)::int         AS total_found
+      FROM stocktake_items
+      WHERE session_id = ANY(${ids})
+      GROUP BY session_id
+    `
+    const byId = new Map(stats.map((s) => [s.session_id, s]))
+
+    return res.json({
+      sessions: sessions.map((s) => {
+        const st = byId.get(s.id) ?? {}
+        const hide = s.status === 'in_progress' && s.blind
+        return {
+          ...shapeStocktakeMeta(s),
+          stats: {
+            total_items: st.total_items ?? 0,
+            counted_items: st.counted_items ?? 0,
+            uncounted_items: (st.total_items ?? 0) - (st.counted_items ?? 0),
+            ...(hide ? {} : {
+              discrepancy_count: st.discrepancy_count ?? 0,
+              total_missing: st.total_missing ?? 0,
+              total_found: st.total_found ?? 0,
+            }),
+          },
+        }
+      }),
+    })
+  } catch (err) {
+    console.error('getStocktakes', err.message)
+    return res.status(500).json({ error: 'Failed to fetch stocktakes' })
+  }
+}
+
+exports.getStocktake = async (req, res) => {
+  const id = parseInt(req.params.id, 10)
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Session ID is required' })
+
+  try {
+    const session = await prisma.stocktakeSession.findUnique({
+      where: { id },
+      include: STOCKTAKE_INCLUDE,
+    })
+    if (!session) return res.status(404).json({ error: 'Stocktake not found' })
+
+    const hide = session.blind && session.status === 'in_progress'
+    return res.json({
+      session: {
+        ...shapeStocktakeMeta(session),
+        items: session.items.map((i) => shapeStocktakeItem(i, hide)),
+        stats: hide ? stocktakeProgress(session.items) : summariseStocktake(session.items),
+      },
+    })
+  } catch (err) {
+    console.error('getStocktake', err.message)
+    return res.status(500).json({ error: 'Failed to fetch stocktake' })
+  }
+}
+
+exports.recordStocktakeCount = async (req, res) => {
+  const sessionId = parseInt(req.params.id, 10)
+  const itemId = parseInt(req.params.itemId, 10)
+  const currentUser = req.user
+  const { counted_qty, reason, note } = req.body || {}
+
+  if (!Number.isInteger(sessionId) || !Number.isInteger(itemId)) {
+    return res.status(400).json({ error: 'Session and item IDs are required' })
+  }
+
+  const hasCount = counted_qty !== undefined
+  const qty = hasCount && counted_qty !== null && counted_qty !== ''
+    ? Number(counted_qty)
+    : null
+
+  if (hasCount && qty !== null && (!Number.isInteger(qty) || qty < 0)) {
+    return res.status(400).json({ error: 'Counted quantity must be a whole number of 0 or more' })
+  }
+  if (reason !== undefined && reason !== null && reason !== '' && !STOCKTAKE_REASONS.includes(reason)) {
+    return res.status(400).json({ error: 'Unknown reason' })
+  }
+
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      const session = await tx.stocktakeSession.findUnique({
+        where: { id: sessionId },
+        select: { id: true, status: true, blind: true },
+      })
+      if (!session) throw httpError('Stocktake not found', 404)
+      if (session.status === 'approved') {
+        throw httpError('This stocktake has been approved and can no longer be edited', 409)
+      }
+      if (hasCount && session.status !== 'in_progress') {
+        throw httpError('Counts are locked once the stocktake is submitted', 409)
+      }
+
+      const item = await tx.stocktakeItem.findUnique({
+        where: { id: itemId },
+        select: { id: true, session_id: true, product_id: true, counted_at: true, counted_qty: true },
+      })
+      if (!item || item.session_id !== sessionId) {
+        throw httpError('Item does not belong to this stocktake', 404)
+      }
+
+      const data = {}
+
+      if (hasCount) {
+        if (qty === null) {
+          // Clearing returns the line to uncounted rather than recording a zero.
+          Object.assign(data, {
+            counted_qty: null, system_qty: null, variance: null,
+            counted_at: null, counted_by: null, reason: null,
+          })
+        } else {
+          // The system figure is read HERE, under the lock, in the same
+          // transaction as the count. This is what removes the drift window.
+          await lockProduct(tx, item.product_id)
+
+          const agg = await tx.productBatch.aggregate({
+            where: { product_id: item.product_id },
+            _sum: { quantity: true },
+          })
+          const systemQty = agg._sum.quantity ?? 0
+
+          Object.assign(data, {
+            counted_qty: qty,
+            system_qty: systemQty,
+            variance: qty - systemQty,
+            counted_at: new Date(),
+            counted_by: currentUser?.username ?? 'Pharmacist',
+          })
+          // A line corrected back to agreement keeps no stale reason.
+          if (qty - systemQty === 0) data.reason = null
+        }
+      }
+
+      if (reason !== undefined) data.reason = reason || null
+      if (note !== undefined) data.note = (typeof note === 'string' && note.trim()) || null
+
+      if (Object.keys(data).length === 0) throw httpError('Nothing to update')
+
+      const updated = await tx.stocktakeItem.update({
+        where: { id: itemId },
+        data,
+        include: {
+          product: { select: { id: true, name: true, unit: true, category: true, normal_price: true } },
+        },
+      })
+
+      return {
+        session,
+        updated,
+        wasRecount: hasCount && item.counted_at != null,
+        previous: item.counted_qty,
+      }
+    })
+
+    // Individual counts are not audited — 60 entries per session is noise. A
+    // recount that overwrites an existing figure is the interesting event.
+    if (result.wasRecount) {
+      await writeAuditLog({
+        staffId: currentUser?.id,
+        user: currentUser?.username,
+        action: 'Stocktake Line Recounted',
+        description:
+          `${result.updated.product.name} in stocktake #${sessionId}: ` +
+          `${result.previous} → ${result.updated.counted_qty}`,
+        category: 'stock',
+        entity: 'StocktakeItem',
+        entityId: itemId,
+        ipAddress: req.ip ?? null,
+      })
+    }
+
+    const hide = result.session.blind && result.session.status === 'in_progress'
+    return res.json({ success: true, item: shapeStocktakeItem(result.updated, hide) })
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message })
+    console.error('recordStocktakeCount', err.message)
+    return res.status(500).json({ error: 'Failed to record count' })
+  }
+}
+
+exports.submitStocktake = async (req, res) => {
+  const id = parseInt(req.params.id, 10)
+  const currentUser = req.user
+  const { confirm_partial } = req.body || {}
+
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Session ID is required' })
+
+  try {
+    const session = await prisma.stocktakeSession.findUnique({
+      where: { id },
+      include: STOCKTAKE_INCLUDE,
+    })
+    if (!session) return res.status(404).json({ error: 'Stocktake not found' })
+    if (session.status !== 'in_progress') {
+      return res.status(409).json({ error: `Stocktake is already ${session.status.replace('_', ' ')}` })
+    }
+
+    const counted = session.items.filter((i) => i.counted_at != null)
+    if (counted.length === 0) {
+      return res.status(400).json({ error: 'Count at least one product before submitting' })
+    }
+
+    const uncounted = session.items.length - counted.length
+    if (uncounted > 0 && confirm_partial !== true) {
+      // Uncounted lines are EXCLUDED from adjustment, never treated as zero.
+      // Treating them as zero would let one careless submit write off the shelf.
+      return res.status(409).json({
+        error:
+          `${uncounted} product(s) were never counted. They will be left unadjusted, ` +
+          `not written off. Resubmit with confirm_partial to continue.`,
+        uncounted_count: uncounted,
+        requires_confirmation: true,
+      })
+    }
+
+    const updated = await prisma.stocktakeSession.update({
+      where: { id },
+      data: {
+        status: 'submitted',
+        submitted_by: currentUser?.username ?? 'Pharmacist',
+        submitted_at: new Date(),
+      },
+      include: STOCKTAKE_INCLUDE,
+    })
+    const stats = summariseStocktake(updated.items)
+
+    await createNotification({
+      targetRoles: ['admin'],
+      type: NOTIFICATION_TYPES.STOCKTAKE_SUBMITTED,
+      title: 'Stocktake awaiting approval',
+      message:
+        `${currentUser?.username ?? 'Pharmacy'} submitted "${updated.label}" — ` +
+        `${stats.counted_items} counted, ${stats.discrepancy_count} discrepanc${stats.discrepancy_count === 1 ? 'y' : 'ies'}, ` +
+        `${Math.abs(stats.total_missing)} unit(s) missing.`,
+      io: safeIO(),
+    })
+
+    await writeAuditLog({
+      staffId: currentUser?.id,
+      user: currentUser?.username,
+      action: 'Stocktake Submitted',
+      description:
+        `Submitted "${updated.label}" — ${stats.counted_items}/${stats.total_items} counted, ` +
+        `${stats.discrepancy_count} discrepancies, ${Math.abs(stats.total_missing)} missing, ` +
+        `${stats.total_found} found`,
+      category: 'stock',
+      entity: 'StocktakeSession',
+      entityId: id,
+      ipAddress: req.ip ?? null,
+    })
+
+    emit('stocktake:submitted', { sessionId: id }, 'admin')
+
+    // Variances are revealed here. This is where the pharmacist annotates
+    // discrepant lines — a blind counter could not do that earlier.
+    return res.json({
+      success: true,
+      session: {
+        ...shapeStocktakeMeta(updated),
+        items: updated.items.map((i) => shapeStocktakeItem(i, false)),
+        stats,
+      },
+    })
+  } catch (err) {
+    console.error('submitStocktake', err.message)
+    return res.status(500).json({ error: 'Failed to submit stocktake' })
   }
 }

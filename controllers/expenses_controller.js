@@ -218,7 +218,7 @@ module.exports.createExpense = async (req, res) => {
       data: {
         description,
         amount,
-        incurred_at: incurred_at || new Date(),
+        incurred_at: new Date(),
         recorded_by: req.user.id ?? null,
       },
       include: RECORDER_INCLUDE,

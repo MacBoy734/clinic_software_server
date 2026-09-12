@@ -1,5 +1,6 @@
 const bcrypt = require('bcryptjs')
 const prisma = require('../lib/prisma')
+const { takeStock, giveStock } = require('./pharmacy_controller')
 const { writeAuditLog, getPeriodRange, todayRange, lastNDays, endOfDay, dayLabel, buildDayBuckets, resolveRange, parseDateRange, getPagination } = require('../utils/helpers')
 const { getSettings, invalidateSettings, SETTINGS_ID } = require('../lib/settings')
 
@@ -31,6 +32,13 @@ function shapeReferral(r) {
     commission_amount: r.commission_amount ?? 0,
     amount_paid: r.status === 'paid' ? (r.amount_paid ?? 0) : 0,
   }
+}
+
+
+const LOCK = { PRODUCT: 1, CUSTOMER: 2 }
+
+function lockProduct(tx, productId) {
+  return tx.$executeRaw`SELECT pg_advisory_xact_lock(${LOCK.PRODUCT}::int, ${productId}::int)`
 }
 
 
@@ -239,6 +247,7 @@ module.exports.getAdminOverview = async (req, res) => {
     return res.status(500).json({ error: 'Failed to load overview' })
   }
 }
+
 
 module.exports.getPharmacyFinanceOverview = async (req, res) => {
   try {
@@ -1232,7 +1241,7 @@ module.exports.getPatientDetail = async (req, res) => {
     const total_visits = patient.visits.length
     const total_billed = patient.visits.reduce((s, v) => s + num(v.bill?.total_amount), 0)
     const total_discounts = patient.visits.reduce((s, v) => s + num(v.bill?.discount_amount), 0)
-    const total_paid = visits.reduce(
+    const total_paid = patient.visits.reduce(
       (s, v) => s + (v.bill?.payments?.reduce((a, p) => a + p.amount, 0) ?? 0),
       0
     )
@@ -1354,7 +1363,7 @@ module.exports.addStaffPost = async (req, res) => {
       data: { username, role, password: hashedPassword },
       select: { id: true, username: true, role: true, is_active: true, created_at: true },
     })
-     await writeAuditLog({
+    await writeAuditLog({
       staffId: req.user?.id,
       user: req.user?.username,
       action: 'Staff Created',
@@ -2020,10 +2029,24 @@ module.exports.updateLabStockQuantity = async (req, res) => {
 
     if (newQuantity < 0) return res.status(400).json({ error: 'Quantity cannot be negative' })
 
-    const item = await prisma.labStock.update({
+       const item = await prisma.labStock.update({
       where: { id: Number(id) },
       data: { current_stock: newQuantity },
     })
+
+    await writeAuditLog({
+      staffId: req.user?.id,
+      user: req.user?.username,
+      action: 'Lab Stock Adjusted',
+      description:
+        `${existing.name}: ${existing.current_stock} → ${newQuantity} ${existing.unit}` +
+        (adjustment !== undefined ? ` (adjustment ${adjustment > 0 ? '+' : ''}${adjustment})` : ' (set directly)'),
+      category: 'stock',
+      entity: 'LabStock',
+      entityId: Number(id),
+      ipAddress: req.ip ?? null,
+    })
+
     return res.json({ message: 'Quantity updated', item })
   } catch (error) {
     console.error('updateLabStockQuantity error:', error)
@@ -2405,7 +2428,7 @@ module.exports.createStockItem = async (req, res) => {
       })
 
       if (Number(current_stock) > 0) {
-        await tx.productBatch.create({
+        const batch = await tx.productBatch.create({
           data: {
             product_id: item.id,
             quantity: Number(current_stock),
@@ -2417,9 +2440,11 @@ module.exports.createStockItem = async (req, res) => {
         await tx.stockMovement.create({
           data: {
             product_id: item.id,
+            batch_id: batch.id,
             delta: Number(current_stock),
             reason: 'restock',
             ref_type: 'product_creation',
+            ref_id: batch.id,
             balance_after: Number(current_stock),
             staff_id: req.user?.id ?? null,
             note: 'Initial stock',
@@ -2427,19 +2452,21 @@ module.exports.createStockItem = async (req, res) => {
         })
       }
 
-      await writeAuditLog({
-        staffId: req.user.id,
-        user: currentUser?.username,
-        action: 'Stock Added',
-        description:
-          `Created a new Item with id ${item.id} and quantity ${result.product.current_stock} `,
-        category: 'Product',
-        entity: 'Product',
-        entityId: result.product.id,
-        ipAddress: req.ip,
-      })
 
       return item
+    })
+    await writeAuditLog({
+      staffId: req.user?.id,
+      user: req.user?.username,
+      action: 'Stock Added',
+      description:
+        `Created ${result.name} (#${result.id}) with opening stock ` +
+        `${result.current_stock} ${result.unit}` +
+        (expiry_date ? `, expires ${expiry_date}` : ', no expiry recorded'),
+      category: 'stock',
+      entity: 'Product',
+      entityId: result.id,
+      ipAddress: req.ip ?? null,
     })
 
     return res.status(201).json({ message: 'Item added', item: result })
@@ -2519,7 +2546,7 @@ module.exports.updateStockItemQuantity = async (req, res) => {
 
   try {
     const result = await prisma.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('product:' || ${id}::text))`
+      await lockProduct(tx, id)
 
       const product = await tx.product.findUnique({
         where: { id },
@@ -2589,15 +2616,47 @@ module.exports.updateStockItemQuantity = async (req, res) => {
 }
 
 module.exports.deleteDrugStockItem = async (req, res) => {
-  const { id } = req.params
+  const id = Number(req.params.id)
+  const currentUser = req.user
+
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: 'Invalid product id' })
+  }
+
   try {
-    const existing = await prisma.product.findUnique({ where: { id: Number(id) } })
+    const existing = await prisma.product.findUnique({
+      where: { id },
+      select: { id: true, name: true, current_stock: true, is_active: true },
+    })
     if (!existing) return res.status(404).json({ error: 'Item not found' })
-    await prisma.product.delete({ where: { id: Number(id) } })
-    return res.json({ message: 'Item deleted' })
+    if (!existing.is_active) {
+      return res.status(409).json({ error: `${existing.name} is already retired` })
+    }
+    if (existing.current_stock > 0) {
+      return res.status(409).json({
+        error:
+          `${existing.name} still has ${existing.current_stock} in stock — ` +
+          `write it off or sell it down before retiring the product`,
+      })
+    }
+
+    await prisma.product.update({ where: { id }, data: { is_active: false } })
+
+    await writeAuditLog({
+      staffId: currentUser?.id,
+      user: currentUser?.username,
+      action: 'Product Retired',
+      description: `Retired ${existing.name} (#${id}) from the catalogue`,
+      category: 'stock',
+      entity: 'Product',
+      entityId: id,
+      ipAddress: req.ip ?? null,
+    })
+
+    return res.json({ message: 'Item retired' })
   } catch (error) {
     console.error('deleteDrugStockItem error:', error.message)
-    return res.status(500).json({ error: 'Failed to delete item' })
+    return res.status(500).json({ error: 'Failed to retire item' })
   }
 }
 
@@ -2882,7 +2941,7 @@ module.exports.verifyRestock = async (req, res) => {
       if (r.status !== 'pending')
         throw Object.assign(new Error('Request already processed'), { http: 409 })
 
-      const qty = adjusted_qty != null ? Number(adjusted_qty) : r.received_qty || r.quantity
+      const qty = adjusted_qty != null ? Number(adjusted_qty) : r.quantity
       if (!Number.isFinite(qty) || qty < 0)
         throw Object.assign(new Error('Invalid quantity'), { http: 400 })
 
@@ -2890,8 +2949,7 @@ module.exports.verifyRestock = async (req, res) => {
         if (!r.product_id)
           throw Object.assign(new Error('Restock request has no linked product'), { http: 422 })
 
-        // ── LOCK: prevents race with takeStock/giveStock on this product ──
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${r.product_id})`
+        await lockProduct(tx, r.product_id)
 
         const product = await tx.product.findUnique({
           where: { id: r.product_id },
@@ -2906,8 +2964,7 @@ module.exports.verifyRestock = async (req, res) => {
           data: { current_stock: { increment: qty } },
         })
 
-        // batch_number is autoincrement — Prisma handles it
-        await tx.productBatch.create({
+        const batch = await tx.productBatch.create({
           data: {
             product_id: product.id,
             expiry_date: finalExpiry,
@@ -2920,6 +2977,7 @@ module.exports.verifyRestock = async (req, res) => {
         await tx.stockMovement.create({
           data: {
             product_id: product.id,
+            batch_id: batch.id,
             delta: qty,
             reason: 'restock',
             ref_type: 'restock_request',
@@ -2943,7 +3001,7 @@ module.exports.verifyRestock = async (req, res) => {
         })
       }
 
-      return tx.restockRequest.update({
+            const request = await tx.restockRequest.update({
         where: { id },
         data: {
           status: 'approved',
@@ -2952,14 +3010,28 @@ module.exports.verifyRestock = async (req, res) => {
           verification_notes: verification_notes ?? null,
           verified_at: new Date(),
         },
+        // RestockRequest carries neither the item name nor the quantity under
+        // the names the audit line used. Pull them from the relations.
+        include: {
+          product: { select: { name: true, unit: true } },
+          lab_stock: { select: { name: true, unit: true } },
+        },
       })
+
+      return { request, qty }
     })
+
+    const { request: updatedRequest, qty: approvedQty } = result
+    const stock = updatedRequest.product ?? updatedRequest.lab_stock
 
     await writeAuditLog({
       staffId: currentUser.id,
       user: currentUser.username,
       action: 'Restock Verified',
-      description: `Verified restock of ${updated.item_name ?? 'item'} (+${updated.received_qty} units)`,
+      description:
+        `Verified restock of ${stock?.name ?? `request #${id}`} ` +
+        `(+${approvedQty} ${stock?.unit ?? 'units'})` +
+        (approvedQty !== request.quantity ? ` — requested ${request.quantity}` : ''),
       category: 'restock',
       entity: 'RestockRequest',
       entityId: id,
@@ -3172,7 +3244,7 @@ module.exports.payReferral = async (req, res) => {
       where: { id: referralId },
       data: {
         status: 'paid',
-        amount_paid: amount,
+        amount_paid: amount_paid,
         paid_at: new Date(),
         paid_by: currentUser.username,
         commission_amount: Math.round(Number(amount_paid)),
@@ -3191,7 +3263,7 @@ module.exports.payReferral = async (req, res) => {
       staffId: currentUser.id,
       user: currentUser.username,
       action: 'commission paid',
-      description: `commision paid for visit ${updated.visit.id})`,
+      description: `commision paid for visit ${updated.visit.id}, amount ${updated.amount_paid}`,
       category: 'referral',
       entity: 'referral',
       entityId: referral.id,
@@ -3765,5 +3837,204 @@ exports.collectCustomerPayment = async (req, res) => {
     if (err.status) return res.status(err.status).json({ error: err.message, ...err.meta })
     console.error('collectCustomerPayment', err)
     res.status(500).json({ error: 'Failed to record payment' })
+  }
+}
+
+// ─── Stocktake review ────────────────────────────────────────────────────────
+
+module.exports.approveStocktake = async (req, res) => {
+  const id = Number(req.params.id)
+  const currentUser = req.user
+  const { review_notes } = req.body || {}
+
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Session ID is required' })
+
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      const session = await tx.stocktakeSession.findUnique({
+        where: { id },
+        include: {
+          items: {
+            include: { product: { select: { id: true, name: true, unit: true } } },
+            // Consistent lock order. Two transactions taking product locks in
+            // opposite orders deadlock.
+            orderBy: { product_id: 'asc' },
+          },
+        },
+      })
+      if (!session) throw Object.assign(new Error('Stocktake not found'), { http: 404 })
+      if (session.status !== 'submitted') {
+        throw Object.assign(
+          new Error(`Only a submitted stocktake can be approved — this one is ${session.status.replace('_', ' ')}`),
+          { http: 409 }
+        )
+      }
+
+      const toPost = session.items.filter(
+        (i) => i.counted_at != null && i.variance !== 0 && i.posted_at == null
+      )
+
+      const now = new Date()
+      const failures = []
+      let postedCount = 0
+
+      for (const item of toPost) {
+        const common = {
+          productId: item.product_id,
+          reason: 'stocktake',
+          refType: 'stocktake_item',
+          refId: item.id,
+          staffId: currentUser?.id,
+          note: `Stocktake "${session.label}"${item.reason ? ` — ${item.reason}` : ''}`,
+        }
+
+        if (item.variance < 0) {
+          // takeStock already walks batches FEFO — units that went missing were
+          // picked from the front of the bin, which is the oldest batch.
+          const out = await takeStock(tx, { ...common, quantity: Math.abs(item.variance) })
+          if (out === null) {
+            failures.push({
+              item_id: item.id,
+              product: item.product.name,
+              variance: item.variance,
+              reason: 'Variance exceeds stock currently on hand',
+            })
+            continue
+          }
+        } else {
+          // batch_id null → giveStock credits the oldest non-exhausted batch.
+          // Found units are usually an unrecorded receipt of unknown age;
+          // assuming the earliest expiry errs toward selling early rather than
+          // toward selling something already expired.
+          await giveStock(tx, { ...common, quantity: item.variance, batch_id: null })
+        }
+
+        await tx.stocktakeItem.update({ where: { id: item.id }, data: { posted_at: now } })
+        postedCount++
+      }
+
+      if (failures.length) {
+        // All-or-nothing. Partial posting leaves a session nobody can reason
+        // about — some lines adjusted, some not, no record of which.
+        throw Object.assign(
+          new Error('Some adjustments could not be posted — stock has moved since the count'),
+          { http: 409, meta: { failures } }
+        )
+      }
+
+      const countedIds = session.items.filter((i) => i.counted_at != null).map((i) => i.product_id)
+      if (countedIds.length) {
+        await tx.product.updateMany({
+          where: { id: { in: countedIds } },
+          data: { last_counted_at: now },
+        })
+      }
+
+      await tx.stocktakeSession.update({
+        where: { id },
+        data: {
+          status: 'approved',
+          reviewed_by: currentUser?.username ?? null,
+          reviewed_by_id: currentUser?.id ?? null,
+          reviewed_at: now,
+          review_notes: (typeof review_notes === 'string' && review_notes.trim()) || null,
+        },
+      })
+
+      const counted = session.items.filter((i) => i.counted_at != null)
+      const disc = counted.filter((i) => i.variance !== 0)
+
+      return {
+        label: session.label,
+        postedCount,
+        missing: disc.reduce((s, i) => s + Math.min(0, i.variance), 0),
+        found: disc.reduce((s, i) => s + Math.max(0, i.variance), 0),
+        uncounted: session.items.length - counted.length,
+      }
+    }, { timeout: 30000 })
+
+    await writeAuditLog({
+      staffId: currentUser?.id,
+      user: currentUser?.username,
+      action: 'Stocktake Approved',
+      description:
+        `Approved "${result.label}" — ${result.postedCount} adjustment(s) posted, ` +
+        `${Math.abs(result.missing)} unit(s) written off, ${result.found} found, ` +
+        `${result.uncounted} left unadjusted`,
+      category: 'stock',
+      entity: 'StocktakeSession',
+      entityId: id,
+      ipAddress: req.ip ?? null,
+    })
+
+    await createNotification({
+      targetRoles: ['pharmacist'],
+      type: NOTIFICATION_TYPES.STOCKTAKE_APPROVED,
+      title: 'Stocktake approved',
+      message: `"${result.label}" was approved — ${result.postedCount} stock adjustment(s) posted.`,
+    })
+
+    return res.json({ success: true, posted_count: result.postedCount })
+  } catch (err) {
+    if (err.http) return res.status(err.http).json({ error: err.message, ...(err.meta ?? {}) })
+    console.error('approveStocktake', err.message)
+    return res.status(500).json({ error: 'Failed to approve stocktake' })
+  }
+}
+
+module.exports.rejectStocktake = async (req, res) => {
+  const id = Number(req.params.id)
+  const currentUser = req.user
+  const { review_notes } = req.body || {}
+
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Session ID is required' })
+  if (!review_notes || !String(review_notes).trim()) {
+    return res.status(400).json({ error: 'A note is required when returning a stocktake' })
+  }
+
+  try {
+    const session = await prisma.stocktakeSession.findUnique({ where: { id } })
+    if (!session) return res.status(404).json({ error: 'Stocktake not found' })
+    if (session.status !== 'submitted') {
+      return res.status(409).json({
+        error: `Only a submitted stocktake can be returned — this one is ${session.status.replace('_', ' ')}`,
+      })
+    }
+
+    await prisma.stocktakeSession.update({
+      where: { id },
+      data: {
+        status: 'in_progress',
+        review_notes: String(review_notes).trim(),
+        reviewed_by: currentUser?.username ?? null,
+        reviewed_by_id: currentUser?.id ?? null,
+        reviewed_at: new Date(),
+        submitted_by: null,
+        submitted_at: null,
+      },
+    })
+
+    await createNotification({
+      targetRoles: ['pharmacist'],
+      type: NOTIFICATION_TYPES.STOCKTAKE_RETURNED,
+      title: 'Stocktake returned',
+      message: `"${session.label}" was returned for correction: ${String(review_notes).trim()}`,
+    })
+
+    await writeAuditLog({
+      staffId: currentUser?.id,
+      user: currentUser?.username,
+      action: 'Stocktake Returned',
+      description: `Returned "${session.label}" for correction — ${String(review_notes).trim()}`,
+      category: 'stock',
+      entity: 'StocktakeSession',
+      entityId: id,
+      ipAddress: req.ip ?? null,
+    })
+
+    return res.json({ success: true })
+  } catch (err) {
+    console.error('rejectStocktake', err.message)
+    return res.status(500).json({ error: 'Failed to return stocktake' })
   }
 }

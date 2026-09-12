@@ -3,7 +3,7 @@ const rateLimit = require('express-rate-limit')
 // ── Standard API limit ──────────────────────────────────────────
 const standardLimit = rateLimit({
   windowMs: 5 * 60 * 1000,
-  max: 150,
+  max: 500,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests — please slow down' },

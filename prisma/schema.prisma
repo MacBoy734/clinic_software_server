@@ -132,18 +132,36 @@ enum ProductCategory {
   general
 }
 enum MovementReason {
-  sale           
-  dispense       
-  issue           
-  restock        
-  return_to_stock 
-  adjustment     
-  writeoff        
+  sale
+  dispense
+  issue
+  restock
+  return_to_stock
+  adjustment
+  writeoff
+  stocktake       
 }
 
 enum OrderDepartment {
   doctor
   lab
+}
+
+enum StocktakeStatus {
+  in_progress
+  submitted
+  approved
+}
+
+enum StocktakeReason {
+  expired
+  damaged
+  broken
+  stolen
+  miscounted
+  misplaced
+  found_unrecorded
+  other
 }
 
 // ─── Staff ────────────────────────────────────────────────────────────────────
@@ -169,6 +187,8 @@ model Staff {
   customer_payments    CustomerPayment[] 
 
   orders_requested PharmacyOrder[] @relation("OrderRequestedBy")
+  stocktakes_started  StocktakeSession[] @relation("StocktakeStarted")
+  stocktakes_reviewed StocktakeSession[] @relation("StocktakeReviewed")
   orders_fulfilled PharmacyOrder[] @relation("OrderFulfilledBy")
   returns_processed OtcSaleReturn[] @relation("ReturnsProcessed")
   stock_movements  StockMovement[]
@@ -520,10 +540,11 @@ model Product {
   normal_price      Int @default(0)
   promotional_price Int @default(0)
   wholesale_price   Int @default(0)
-
+  last_counted_at DateTime?
   created_at   DateTime  @default(now())
   updated_at   DateTime  @updatedAt
 
+  stocktake_items StocktakeItem[]
   otc_sale_items     OtcSaleItem[]
   prescription_items PrescriptionItem[]
   order_items        PharmacyOrderItem[]
@@ -935,4 +956,66 @@ model Referral {
   visit Visit @relation(fields: [visit_id], references: [id])
 
   @@map("external_referrals")
+}
+
+model StocktakeSession {
+  id     Int             @id @default(autoincrement())
+  label  String
+  status StocktakeStatus @default(in_progress)
+
+  // The sheet hides system quantities while blind. A counter who sees
+  // "System: 47" counts to 47 — anchoring makes the exercise theatre.
+  blind Boolean @default(true)
+
+  started_by_id Int?
+  started_by    String
+  started_at    DateTime @default(now())
+
+  submitted_by String?
+  submitted_at DateTime?
+
+  reviewed_by_id Int?
+  reviewed_by    String?
+  reviewed_at    DateTime?
+  review_notes   String?
+
+  updated_at DateTime @updatedAt
+
+  starter  Staff? @relation("StocktakeStarted", fields: [started_by_id], references: [id], onDelete: SetNull)
+  reviewer Staff? @relation("StocktakeReviewed", fields: [reviewed_by_id], references: [id], onDelete: SetNull)
+
+  items StocktakeItem[]
+
+  @@index([status, started_at])
+  @@map("stocktake_sessions")
+}
+
+model StocktakeItem {
+  id         Int @id @default(autoincrement())
+  session_id Int
+  product_id Int
+
+  shelf_location String?
+
+  counted_qty Int?
+  system_qty  Int?
+  variance    Int?
+  counted_at  DateTime?
+  counted_by  String?
+
+  reason StocktakeReason?
+  note   String?
+
+  posted_at DateTime?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  session StocktakeSession @relation(fields: [session_id], references: [id], onDelete: Cascade)
+  product Product          @relation(fields: [product_id], references: [id])
+
+  @@unique([session_id, product_id])
+  @@index([session_id, shelf_location])
+  @@index([product_id])
+  @@map("stocktake_items")
 }

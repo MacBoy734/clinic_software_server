@@ -1,5 +1,6 @@
 const express = require('express')
 const c = require('../controllers/admin_controller')
+const p = require('../controllers/pharmacy_controller')
 const router = express.Router()
 const { authenticate, authorize } = require('../middleware/auth')
 const schemas = require('../utils/schemaValidations')
@@ -14,6 +15,7 @@ router.use(authenticate, authorize('admin'))
 
 // GET routes
 router.get('/staff', c.getAllStaff)
+router.get('/internal-orders', p.getInternalOrders)
 router.get('/lab-requests', c.getLabRequests)
 router.get('/restocks', c.getRestocks)
 router.get('/overview', c.getAdminOverview)
@@ -55,6 +57,8 @@ router.post('/charge-templates', c.createChargeTemplate)
 router.post('/drug-stock', c.createStockItem)
 router.post('/staff', c.addStaffPost)
 router.post('/lab-stock', c.createLabStockItem)
+router.post('/stocktake/:id/approve',  c.approveStocktake)
+router.post('/stocktake/:id/reject',  c.rejectStocktake)
 
 // PATCH routes
 router.patch('/referrals/:id/pay', c.payReferral)
