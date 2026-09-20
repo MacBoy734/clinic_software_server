@@ -1,6 +1,8 @@
 const prisma = require('../lib/prisma')
 const { getIO } = require('../utils/socket')
-const { todayRange, writeAuditLog, createNotification, NOTIFICATION_TYPES } = require('../utils/helpers')
+const { todayRange, writeAuditLog, createNotification, NOTIFICATION_TYPES, getNextQueueNumber } = require('../utils/helpers')
+
+// TODO: incase we ever let the reception to collect the outstanding balances, we need to check on discount so new discount doesnt wipe the old discount. For now, we will not allow the reception to collect outstanding balances, so this is not a problem.
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -280,7 +282,7 @@ module.exports.registerVisit = async (req, res) => {
 
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('visit-registration'))`
 
-      const todayCount = await tx.visit.count({ where: { arrived_at: todayRange() } })
+      const queueNumber = await getNextQueueNumber(tx)
 
       let labItems = []
       if (labIds.length > 0) {
@@ -339,7 +341,7 @@ module.exports.registerVisit = async (req, res) => {
           patient_id: pid,
           visit_type,
           status: initialStatus,
-          queue_number: todayCount + 1,
+          queue_number: queueNumber,
           referred_by: visit_type === 'direct_lab' ? (referred_by || null) : null,
           referrer_phone: visit_type === 'direct_lab' ? (referrer_phone || null) : null,
           bill: { create: billData },
@@ -432,21 +434,6 @@ module.exports.registerVisit = async (req, res) => {
   }
 }
 
-
-async function updateVisitStatus(req, res, status) {
-  const { id } = req.params
-  try {
-    const visit = await prisma.visit.update({
-      where: { id },
-      data: { status },
-      include: VISIT_INCLUDE,
-    })
-    return res.json(visit)
-  } catch (error) {
-    console.error(`updateVisitStatus(${status}) error:`, error)
-    return res.status(500).json({ error: 'Failed to update visit status' })
-  }
-}
 
 
 // ─── PATCH /api/reception/payments ────────────────────────────────────────────
@@ -874,8 +861,3 @@ module.exports.waivePayment = async (req, res) => {
   }
 }
 
-module.exports.forwardToDoctor = (req, res) => updateVisitStatus(req, res, 'with_doctor')
-module.exports.forwardToLab = (req, res) => updateVisitStatus(req, res, 'lab')
-module.exports.forwardToBilling = (req, res) => updateVisitStatus(req, res, 'billing')
-module.exports.markDone = (req, res) => updateVisitStatus(req, res, 'done')
-module.exports.archiveVisit = (req, res) => updateVisitStatus(req, res, 'archived')

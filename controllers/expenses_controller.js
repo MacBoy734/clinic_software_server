@@ -13,6 +13,8 @@ const MODELS = {
   pharmacy: prisma.pharmacyExpense,
 }
 
+// TODO consider making expenses one model instead of clinic and pharmacy separate models. This would simplify the code and make it easier to manage expenses across domains.
+
 function resolveDomain(req) {
   const role = req.user.role
   const requestedDomain = req.query?.domain || req.body?.domain

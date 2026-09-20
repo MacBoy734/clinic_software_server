@@ -1,11 +1,3 @@
-/**
- * server/lib/helpers.js
- *
- * Shared utilities used across all controllers.
- * Import only what you need:
- *
- *   const { getPeriodRange, requireFields, createNotification } = require('../lib/helpers')
- */
 
 const prisma = require('../lib/prisma')
 
@@ -27,11 +19,13 @@ function getPeriodRange(period) {
       break
     }
     case 'last_30_days':
-      // 30 days inclusive of today.
       start.setDate(start.getDate() - 29)
       break
     case 'this_year':
       start.setMonth(0, 1)
+      break
+    case 'all':
+      start.setFullYear(2000, 0, 1)
       break
     case 'this_month':
     default:
@@ -230,7 +224,6 @@ const NOTIFICATION_TYPES = {
   STOCKTAKE_SUBMITTED: 'stocktake_submitted',
   STOCKTAKE_RETURNED: 'stocktake_returned',
   STOCKTAKE_APPROVED: 'stocktake_approved',
-  STOCK_DRIFT: 'stock_drift',
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -350,8 +343,12 @@ function buildDayBuckets(start, days) {
 }
 
 function parseDateRange(from, to) {
-  const fromDate = new Date(`${from}T00:00:00.000Z`)
-  const toDate = new Date(`${to}T23:59:59.999Z`)
+  const fromDate = new Date(from)
+  fromDate.setHours(0, 0, 0, 0)
+
+  const toDate = new Date(to)
+  toDate.setHours(23, 59, 59, 999)
+
   return { fromDate, toDate }
 }
 
@@ -383,84 +380,7 @@ function validatePaymentLines(payments, total) {
 
 
 
-// ─── Lock ─────────────────────────────────────────────────────────────────────
 
-async function lockBill(tx, visitId) {
-  const bill = await tx.bill.upsert({
-    where: { visit_id: visitId },
-    create: { visit_id: visitId },
-    update: {},
-    select: { id: true },
-  })
-  await tx.$executeRaw`SELECT id FROM bills WHERE id = ${bill.id} FOR UPDATE`
-  return bill.id
-}
-
-
-// ─── Total ────────────────────────────────────────────────────────────────────
-
-async function recomputeMedicationFee(tx, visitId) {
-  // ── Defensive: tx must be a Prisma transaction client ──────────────────
-  if (!tx || typeof tx.bill !== 'object') {
-    throw new Error('recomputeMedicationFee requires a Prisma transaction client as first argument')
-  }
-  if (!visitId || !Number.isInteger(Number(visitId))) {
-    throw new Error('recomputeMedicationFee requires a valid visitId as second argument')
-  }
-
-  // ── Lock bill row (prevents concurrent prescriptions on same visit from
-  //    reading stale state and writing conflicting totals) ────────────────
-  await tx.$queryRaw`SELECT id FROM bills WHERE visit_id = ${visitId} FOR UPDATE`
-
-  // ── Read current bill (we need the other fee fields to recalc total) ───
-  const bill = await tx.bill.findUnique({
-    where: { visit_id: visitId },
-    select: {
-      id: true,
-      consultation_fee: true,
-      lab_fee: true,
-      procedure_fee: true,
-      discount_amount: true,
-    },
-  })
-
-  // A visit in the pharmacy MUST have a bill. If it doesn't, the workflow
-  // is broken upstream (registration didn't create a bill). We throw so the
-  // transaction rolls back — stock is NOT deducted and the pharmacist sees
-  // an error instead of giving away free medication.
-  if (!bill) {
-    throw new Error(`No bill found for visit ${visitId}. Cannot dispense without a billing record.`)
-  }
-
-  // ── Sum medication_fee from ONLY issued prescription items ─────────────
-  const prescriptions = await tx.prescription.findMany({
-    where: { visit_id: visitId },
-    include: { items: { where: { status: 'issued' } } },
-  })
-
-  const medicationFee = prescriptions.reduce((sum, p) => {
-    return sum + p.items.reduce((s, i) => s + (i.unit_cost || 0) * (i.quantity || 0), 0)
-  }, 0)
-
-  // ── Recompute total ─────────────────────────────────────────────────────
-  const newTotal =
-    (bill.consultation_fee || 0) +
-    (bill.lab_fee || 0) +
-    medicationFee +
-    (bill.procedure_fee || 0) -
-    (bill.discount_amount || 0)
-
-  const safeTotal = Math.max(0, newTotal)
-
-  // ── Atomically update both fields ──────────────────────────────────────
-  await tx.bill.update({
-    where: { id: bill.id },
-    data: {
-      medication_fee: medicationFee,
-      total_amount: safeTotal,
-    },
-  })
-}
 
 
 const BILLABLE_ITEM_STATUSES = ['issued']
@@ -504,14 +424,13 @@ async function recomputeMedicationFee(tx, visitId) {
     bill.consultation_fee +
     bill.lab_fee +
     medicationFee +
-    bill.procedure_fee -
-    bill.discount_amount
+    bill.procedure_fee 
 
   await tx.bill.update({
     where: { id: bill.id },
     data: {
       medication_fee: medicationFee,
-      total_amount: Math.max(0, newTotal),
+      total_amount: newTotal,
     },
   })
 }
@@ -555,8 +474,6 @@ module.exports = {
   parseDateRange,
   getPagination,
   validatePaymentLines,
-
-  lockBill,
   recomputeMedicationFee,
   BILLABLE_ITEM_STATUSES
 }

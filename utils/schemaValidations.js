@@ -45,7 +45,7 @@ const UrgencyEnum = z.enum(['routine', 'urgent', 'stat'])
 const GenderEnum = z.enum(['male', 'female', 'other'])
 const BloodGroupEnum = z.enum(['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']).optional().nullable()
 const AgeUnitEnum = z.enum(['years', 'months', 'weeks', 'days']).default('years')
-const MovementReasonEnum = z.enum(['sale', 'dispense', 'issue', 'restock', 'return_to_stock', 'adjustment', 'writeoff'])
+const MovementReasonEnum = z.enum(['sale', 'dispense', 'issue', 'restock', 'return_to_stock', 'adjustment', 'writeoff', 'stocktake', 'transfer_in', 'transfer_out', 'other'])
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SHARED INPUT SHAPES
@@ -525,6 +525,7 @@ const itemResultSchema = z.object({
   result: z.string().trim().max(5000).nullable().optional(),
   result_data: z.record(z.unknown()).nullable().optional(),
   result_notes: z.string().trim().max(2000).nullable().optional(),
+  applied_ranges: z.record(z.unknown()).nullable().optional(),
   flagged: z.boolean().default(false),
   stock_used: z.array(stockUsageRowSchema).optional(),
 })

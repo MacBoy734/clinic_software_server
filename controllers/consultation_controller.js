@@ -39,7 +39,7 @@ function shapeVisit(v) {
     consultation_fee: v.bill?.consultation_fee ?? 0,
     lab_fee: v.bill?.lab_fee ?? 0,
     medication_fee: v.bill?.medication_fee ?? 0,
-    bill_total: v.bill?.total_amount ?? 0,
+    bill_total: (v.bill?.consultation_fee ?? 0) + (v.bill?.lab_fee ?? 0) + (v.bill?.medication_fee ?? 0) + (v.bill?.procedure_fee ?? 0),
     arrived_at: v.arrived_at,
     temperature: v.vitals?.temperature ?? null,
     bp_systolic: v.vitals?.bp_systolic ?? null,
@@ -896,11 +896,6 @@ exports.patchVisit = async (req, res) => {
 
     const existing = await prisma.visit.findUnique({ where: { id }, select: { status: true, doctor_id: true } })
     if (!existing) return res.status(404).json({ error: 'Visit not found' })
-    if (!DOCTOR_ACTIONABLE_STATUSES.includes(existing.status)) {
-      return res.status(409).json({
-        error: `Patient is at ${existing.status} and can no longer be updated from consultation.`,
-      })
-    }
 
     // ── Vitals fields ──────────────────────────────────────────────────────
     const VITAL_KEYS = [
@@ -959,6 +954,17 @@ exports.patchVisit = async (req, res) => {
     }
 
     await prisma.$transaction(async (tx) => {
+      const fresh = await tx.visit.findUnique({
+        where: { id },
+        select: { status: true },
+      })
+      if (!fresh) throw Object.assign(new Error('Visit not found'), { status: 404 })
+      if (!DOCTOR_ACTIONABLE_STATUSES.includes(fresh.status)) {
+        throw Object.assign(
+          new Error(`Patient is at ${fresh.status} and can no longer be updated from consultation.`),
+          { status: 409 }
+        )
+      }
       if (Object.keys(prismaVitals).length > 0) {
         await tx.vitals.upsert({
           where: { visit_id: id },
@@ -971,8 +977,25 @@ exports.patchVisit = async (req, res) => {
       }
     })
 
+     try {
+      await writeAuditLog({
+        staffId: req.user?.id,
+        user: req.user?.username,
+        action: 'Visit Updated',
+        description:
+          `Updated visit #${id} — ${Object.keys({ ...visitPayload, ...prismaVitals }).join(', ')}`,
+        category: 'patient',
+        entity: 'Visit',
+        entityId: id,
+        ipAddress: req.ip ?? null,
+      })
+    } catch (sideErr) {
+      console.error('patchVisit audit log failed:', sideErr.message)
+    }
+
     res.json({ success: true })
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message })
     console.error('patchVisit', err.message)
     res.status(500).json({ error: 'Failed to update visit' })
   }

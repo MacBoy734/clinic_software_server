@@ -1,7 +1,7 @@
 const bcrypt = require('bcryptjs')
 const prisma = require('../lib/prisma')
 const { takeStock, giveStock } = require('./pharmacy_controller')
-const { writeAuditLog, getPeriodRange, todayRange, lastNDays, endOfDay, dayLabel, buildDayBuckets, resolveRange, parseDateRange, getPagination } = require('../utils/helpers')
+const { writeAuditLog, getPeriodRange, todayRange, lastNDays, endOfDay, dayLabel, buildDayBuckets, resolveRange, parseDateRange, getPagination, createNotification, NOTIFICATION_TYPES } = require('../utils/helpers')
 const { getSettings, invalidateSettings, SETTINGS_ID } = require('../lib/settings')
 
 
@@ -13,6 +13,10 @@ function getPeriodStart(period) {
   if (period === 'this_month') { d.setDate(1); return d }
   if (period === 'this_year') { d.setMonth(0, 1); return d }
   return d
+}
+
+function lockCustomer(tx, customerId) {
+  return tx.$executeRaw`SELECT pg_advisory_xact_lock(${LOCK.CUSTOMER}::int, ${customerId}::int)`
 }
 
 
@@ -2615,47 +2619,47 @@ module.exports.updateStockItemQuantity = async (req, res) => {
   }
 }
 
-module.exports.deleteDrugStockItem = async (req, res) => {
+module.exports.deleteLabStockItem = async (req, res) => {
   const id = Number(req.params.id)
   const currentUser = req.user
 
   if (!Number.isInteger(id)) {
-    return res.status(400).json({ error: 'Invalid product id' })
+    return res.status(400).json({ error: 'Invalid lab stock id' })
   }
 
   try {
-    const existing = await prisma.product.findUnique({
+    const existing = await prisma.labStock.findUnique({
       where: { id },
-      select: { id: true, name: true, current_stock: true, is_active: true },
+      select: { id: true, name: true, current_stock: true, unit: true, is_active: true },
     })
-    if (!existing) return res.status(404).json({ error: 'Item not found' })
+    if (!existing) return res.status(404).json({ error: 'Stock item not found' })
     if (!existing.is_active) {
       return res.status(409).json({ error: `${existing.name} is already retired` })
     }
     if (existing.current_stock > 0) {
       return res.status(409).json({
         error:
-          `${existing.name} still has ${existing.current_stock} in stock — ` +
-          `write it off or sell it down before retiring the product`,
+          `${existing.name} still has ${existing.current_stock} ${existing.unit} in stock — ` +
+          `write it down before retiring it`,
       })
     }
 
-    await prisma.product.update({ where: { id }, data: { is_active: false } })
+    await prisma.labStock.update({ where: { id }, data: { is_active: false } })
 
     await writeAuditLog({
       staffId: currentUser?.id,
       user: currentUser?.username,
-      action: 'Product Retired',
-      description: `Retired ${existing.name} (#${id}) from the catalogue`,
+      action: 'Lab Stock Retired',
+      description: `Retired ${existing.name} (#${id})`,
       category: 'stock',
-      entity: 'Product',
+      entity: 'LabStock',
       entityId: id,
       ipAddress: req.ip ?? null,
     })
 
-    return res.json({ message: 'Item retired' })
+    return res.json({ message: 'Stock item retired' })
   } catch (error) {
-    console.error('deleteDrugStockItem error:', error.message)
+    console.error('deleteLabStockItem error:', error.message)
     return res.status(500).json({ error: 'Failed to retire item' })
   }
 }
@@ -3010,8 +3014,6 @@ module.exports.verifyRestock = async (req, res) => {
           verification_notes: verification_notes ?? null,
           verified_at: new Date(),
         },
-        // RestockRequest carries neither the item name nor the quantity under
-        // the names the audit line used. Pull them from the relations.
         include: {
           product: { select: { name: true, unit: true } },
           lab_stock: { select: { name: true, unit: true } },
@@ -3248,7 +3250,6 @@ module.exports.payReferral = async (req, res) => {
         paid_at: new Date(),
         paid_by: currentUser.username,
         commission_amount: Math.round(Number(amount_paid)),
-        paid_at: new Date(),
         notes
       },
       include: {
@@ -3382,7 +3383,6 @@ module.exports.getFinanceOverview = async (req, res) => {
       const billed =
         b.consultation_fee + b.lab_fee + b.medication_fee + b.procedure_fee
       const paid = b.payments.reduce((s, p) => s + p.amount, 0)
-      console.log(`Bill ${b.id}: billed=${billed}, discount=${b.discount_amount}, paid=${paid}`)
       totalCredit += Math.max(0, billed - b.discount_amount - paid)
     }
 
@@ -3777,6 +3777,7 @@ exports.collectCustomerPayment = async (req, res) => {
 
   try {
     const result = await prisma.$transaction(async (tx) => {
+      await lockCustomer(tx, customerId)
       const customer = await tx.pharmacyCustomer.findUnique({
         where: { id: customerId },
         include: {
@@ -3846,39 +3847,70 @@ module.exports.approveStocktake = async (req, res) => {
   const id = Number(req.params.id)
   const currentUser = req.user
   const { review_notes } = req.body || {}
+  const notes = (typeof review_notes === 'string' && review_notes.trim()) || null
 
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'Session ID is required' })
 
   try {
     const result = await prisma.$transaction(async (tx) => {
+      const now = new Date()
+
+      // The status change is the first write, not a check followed by one. A
+      // second approval blocks on this row, then matches nothing.
+      const claim = await tx.stocktakeSession.updateMany({
+        where: { id, status: 'submitted' },
+        data: {
+          status: 'approved',
+          reviewed_by: currentUser?.username ?? null,
+          reviewed_by_id: currentUser?.id ?? null,
+          reviewed_at: now,
+          review_notes: notes,
+        },
+      })
+      if (claim.count === 0) {
+        const existing = await tx.stocktakeSession.findUnique({
+          where: { id },
+          select: { status: true },
+        })
+        if (!existing) throw Object.assign(new Error('Stocktake not found'), { http: 404 })
+        throw Object.assign(
+          new Error(`Only a submitted stocktake can be approved — this one is ${existing.status.replace('_', ' ')}`),
+          { http: 409 }
+        )
+      }
+
       const session = await tx.stocktakeSession.findUnique({
         where: { id },
-        include: {
+        select: {
+          label: true,
           items: {
-            include: { product: { select: { id: true, name: true, unit: true } } },
+            where: { counted_at: { not: null } },
+            select: {
+              id: true, product_id: true, variance: true, reason: true, posted_at: true,
+              product: { select: { name: true, unit: true } },
+            },
             // Consistent lock order. Two transactions taking product locks in
             // opposite orders deadlock.
             orderBy: { product_id: 'asc' },
           },
         },
       })
-      if (!session) throw Object.assign(new Error('Stocktake not found'), { http: 404 })
-      if (session.status !== 'submitted') {
-        throw Object.assign(
-          new Error(`Only a submitted stocktake can be approved — this one is ${session.status.replace('_', ' ')}`),
-          { http: 409 }
-        )
-      }
 
-      const toPost = session.items.filter(
-        (i) => i.counted_at != null && i.variance !== 0 && i.posted_at == null
-      )
-
-      const now = new Date()
       const failures = []
+      const resolved = []
       let postedCount = 0
+      let missing = 0
+      let found = 0
 
-      for (const item of toPost) {
+      for (const item of session.items) {
+        // Adjusted on an earlier pass, or nothing to adjust.
+        if (item.posted_at != null || item.variance === 0) {
+          resolved.push(item.product_id)
+          continue
+        }
+
+        await lockProduct(tx, item.product_id)
+
         const common = {
           productId: item.product_id,
           reason: 'stocktake',
@@ -3889,78 +3921,104 @@ module.exports.approveStocktake = async (req, res) => {
         }
 
         if (item.variance < 0) {
-          // takeStock already walks batches FEFO — units that went missing were
-          // picked from the front of the bin, which is the oldest batch.
-          const out = await takeStock(tx, { ...common, quantity: Math.abs(item.variance) })
-          if (out === null) {
+          const qty = -item.variance
+
+          // takeStock throws — rather than returning null — at two points that
+          // come after it has already decremented the product. A throw here
+          // would roll back every line posted so far, so the shortfall is
+          // checked under the lock and takeStock is never asked to fail.
+          const [product, live] = await Promise.all([
+            tx.product.findUnique({
+              where: { id: item.product_id },
+              select: { current_stock: true },
+            }),
+            tx.productBatch.aggregate({
+              where: { product_id: item.product_id, is_exhausted: false, quantity: { gt: 0 } },
+              _sum: { quantity: true },
+            }),
+          ])
+          const onHand = Math.min(product?.current_stock ?? 0, live._sum.quantity ?? 0)
+
+          if (onHand < qty) {
             failures.push({
               item_id: item.id,
+              product_id: item.product_id,
               product: item.product.name,
               variance: item.variance,
-              reason: 'Variance exceeds stock currently on hand',
+              available: onHand,
+              reason: `Only ${onHand} ${item.product.unit ?? 'unit(s)'} on hand — ${qty} needed to post this shortfall`,
             })
             continue
           }
+
+          const out = await takeStock(tx, { ...common, quantity: qty })
+          if (out === null) {
+            failures.push({
+              item_id: item.id,
+              product_id: item.product_id,
+              product: item.product.name,
+              variance: item.variance,
+              available: onHand,
+              reason: 'Stock moved while the adjustment was being posted',
+            })
+            continue
+          }
+          missing += item.variance
         } else {
-          // batch_id null → giveStock credits the oldest non-exhausted batch.
-          // Found units are usually an unrecorded receipt of unknown age;
-          // assuming the earliest expiry errs toward selling early rather than
-          // toward selling something already expired.
           await giveStock(tx, { ...common, quantity: item.variance, batch_id: null })
+          found += item.variance
         }
 
         await tx.stocktakeItem.update({ where: { id: item.id }, data: { posted_at: now } })
         postedCount++
+        resolved.push(item.product_id)
       }
 
-      if (failures.length) {
-        // All-or-nothing. Partial posting leaves a session nobody can reason
-        // about — some lines adjusted, some not, no record of which.
-        throw Object.assign(
-          new Error('Some adjustments could not be posted — stock has moved since the count'),
-          { http: 409, meta: { failures } }
-        )
-      }
-
-      const countedIds = session.items.filter((i) => i.counted_at != null).map((i) => i.product_id)
-      if (countedIds.length) {
+      // Products still in dispute stay unstamped, so the rotation brings them
+      // round first rather than treating them as freshly verified.
+      if (resolved.length) {
         await tx.product.updateMany({
-          where: { id: { in: countedIds } },
+          where: { id: { in: resolved } },
           data: { last_counted_at: now },
         })
       }
 
-      await tx.stocktakeSession.update({
-        where: { id },
-        data: {
-          status: 'approved',
-          reviewed_by: currentUser?.username ?? null,
-          reviewed_by_id: currentUser?.id ?? null,
-          reviewed_at: now,
-          review_notes: (typeof review_notes === 'string' && review_notes.trim()) || null,
-        },
+      if (failures.length) {
+        const summary =
+          `${failures.length} line(s) returned for recount — ` +
+          `${failures.map((f) => f.product).join(', ')}. ` +
+          `The other ${postedCount} adjustment(s) were posted and will not be posted again.`
+        await tx.stocktakeSession.update({
+          where: { id },
+          data: {
+            status: 'in_progress',
+            submitted_by: null,
+            submitted_at: null,
+            review_notes: notes ? `${notes} — ${summary}` : summary,
+          },
+        })
+      }
+
+      const uncounted = await tx.stocktakeItem.count({
+        where: { session_id: id, counted_at: null },
       })
 
-      const counted = session.items.filter((i) => i.counted_at != null)
-      const disc = counted.filter((i) => i.variance !== 0)
-
-      return {
-        label: session.label,
-        postedCount,
-        missing: disc.reduce((s, i) => s + Math.min(0, i.variance), 0),
-        found: disc.reduce((s, i) => s + Math.max(0, i.variance), 0),
-        uncounted: session.items.length - counted.length,
-      }
+      return { label: session.label, postedCount, missing, found, uncounted, failures }
     }, { timeout: 30000 })
+
+    const partial = result.failures.length > 0
 
     await writeAuditLog({
       staffId: currentUser?.id,
       user: currentUser?.username,
-      action: 'Stocktake Approved',
+      action: partial ? 'Stocktake Partially Approved' : 'Stocktake Approved',
       description:
-        `Approved "${result.label}" — ${result.postedCount} adjustment(s) posted, ` +
-        `${Math.abs(result.missing)} unit(s) written off, ${result.found} found, ` +
-        `${result.uncounted} left unadjusted`,
+        `${partial ? 'Partially approved' : 'Approved'} "${result.label}" — ` +
+        `${result.postedCount} adjustment(s) posted, ${Math.abs(result.missing)} unit(s) written off, ` +
+        `${result.found} found, ${result.uncounted} left uncounted` +
+        (partial
+          ? `. Returned for recount: ${result.failures.map((f) => `${f.product} (${f.variance})`).join(', ')}`
+          : ''),
       category: 'stock',
       entity: 'StocktakeSession',
       entityId: id,
@@ -3969,12 +4027,20 @@ module.exports.approveStocktake = async (req, res) => {
 
     await createNotification({
       targetRoles: ['pharmacist'],
-      type: NOTIFICATION_TYPES.STOCKTAKE_APPROVED,
-      title: 'Stocktake approved',
-      message: `"${result.label}" was approved — ${result.postedCount} stock adjustment(s) posted.`,
+      type: partial ? NOTIFICATION_TYPES.STOCKTAKE_RETURNED : NOTIFICATION_TYPES.STOCKTAKE_APPROVED,
+      title: partial ? 'Stocktake partly approved' : 'Stocktake approved',
+      message: partial
+        ? `"${result.label}" — ${result.postedCount} adjustment(s) posted. ${result.failures.length} line(s) need a recount: ${result.failures.map((f) => f.product).join(', ')}.`
+        : `"${result.label}" was approved — ${result.postedCount} stock adjustment(s) posted.`,
     })
 
-    return res.json({ success: true, posted_count: result.postedCount })
+    return res.json({
+      success: true,
+      partial,
+      status: partial ? 'in_progress' : 'approved',
+      posted_count: result.postedCount,
+      failures: result.failures,
+    })
   } catch (err) {
     if (err.http) return res.status(err.http).json({ error: err.message, ...(err.meta ?? {}) })
     console.error('approveStocktake', err.message)
@@ -3993,16 +4059,13 @@ module.exports.rejectStocktake = async (req, res) => {
   }
 
   try {
-    const session = await prisma.stocktakeSession.findUnique({ where: { id } })
+        const session = await prisma.stocktakeSession.findUnique({ where: { id } })
     if (!session) return res.status(404).json({ error: 'Stocktake not found' })
-    if (session.status !== 'submitted') {
-      return res.status(409).json({
-        error: `Only a submitted stocktake can be returned — this one is ${session.status.replace('_', ' ')}`,
-      })
-    }
 
-    await prisma.stocktakeSession.update({
-      where: { id },
+    // Conditional write, not a check. A concurrent approve or return matches
+    // nothing here rather than both proceeding.
+    const { count } = await prisma.stocktakeSession.updateMany({
+      where: { id, status: 'submitted' },
       data: {
         status: 'in_progress',
         review_notes: String(review_notes).trim(),
@@ -4013,6 +4076,15 @@ module.exports.rejectStocktake = async (req, res) => {
         submitted_at: null,
       },
     })
+    if (count === 0) {
+      const fresh = await prisma.stocktakeSession.findUnique({
+        where: { id },
+        select: { status: true },
+      })
+      return res.status(409).json({
+        error: `Only a submitted stocktake can be returned — this one is ${(fresh?.status ?? 'gone').replace('_', ' ')}`,
+      })
+    }
 
     await createNotification({
       targetRoles: ['pharmacist'],

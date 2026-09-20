@@ -26,12 +26,7 @@ router.post('/register',
   c.registerVisit
 )
 
-// ─── PATCH status transitions (prevents NaN / abc IDs) ───────────────────────
-router.patch('/visits/:id/forward-to-doctor', authenticate, authorize('receptionist'), validate({ params: schemas.idParamSchema }), c.forwardToDoctor)
-router.patch('/visits/:id/forward-to-lab',    authenticate, authorize('receptionist'), validate({ params: schemas.idParamSchema }), c.forwardToLab)
-router.patch('/visits/:id/forward-to-billing',authenticate, authorize('receptionist'), validate({ params: schemas.idParamSchema }), c.forwardToBilling)
-router.patch('/visits/:id/mark-done',         authenticate, authorize('receptionist'), validate({ params: schemas.idParamSchema }), c.markDone)
-router.patch('/visits/:id/archive',           authenticate, authorize('receptionist'), validate({ params: schemas.idParamSchema }), c.archiveVisit)
+
 
 
 router.patch('/visits/:id/waive',

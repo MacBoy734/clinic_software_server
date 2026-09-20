@@ -127,13 +127,13 @@ module.exports.takeStock = async function (tx, { productId, quantity, reason, re
   const batches_used = []
   let remaining = quantity
 
-   if (batches.length === 0) {
+  if (batches.length === 0) {
     throw new Error(
       `${product.name} has stock (${product.current_stock}) but no batch records — ` +
       `cannot deduct. Create an opening-balance batch for this product first.`
     )
   }
-  
+
 
   // Walk batches oldest-first (FEFO).
   // If oldest doesn't have enough, exhaust it and move to the next oldest.
@@ -337,7 +337,7 @@ function shapeStocktakeMeta(s) {
 }
 
 
-function shapeStocktakeItem(item, hideSystem) {
+function shapeStocktakeItem(item, hideSystem, moved) {
   const base = {
     id: item.id,
     product_id: item.product_id,
@@ -354,13 +354,16 @@ function shapeStocktakeItem(item, hideSystem) {
   }
   if (hideSystem) return base
 
-  return {
+    return {
     ...base,
     system_qty: item.system_qty,
     variance: item.variance,
     retail_value: item.variance != null
       ? Math.abs(item.variance) * (item.product?.normal_price ?? 0)
       : 0,
+    moved_since_count: moved?.net ?? 0,
+    movements_since_count: moved?.movements ?? 0,
+    last_moved_at: moved?.last_moved_at ?? null,
   }
 }
 
@@ -873,8 +876,6 @@ exports.dispensePrescription = async (req, res) => {
       return res.status(400).json({ error: `Prescription is already ${prescription.status}` })
     }
 
-    const linked = prescription.items.filter((it) => it.product_id != null)
-    const unlinked = prescription.items.filter((it) => it.product_id == null)
     const now = new Date()
 
     // ── Transaction with row locking ───────────────────────────────────────
@@ -891,6 +892,13 @@ exports.dispensePrescription = async (req, res) => {
       if (freshRx?.status !== 'pending') {
         throw Object.assign(new Error('Prescription was modified by another user'), { status: 409 })
       }
+
+      const freshItems = await tx.prescriptionItem.findMany({
+        where: { prescription_id: id, status: 'pending' },
+        orderBy: { id: 'asc' },
+      })
+      const linked = freshItems.filter((it) => it.product_id != null)
+      const unlinked = freshItems.filter((it) => it.product_id == null)
 
       const issuedItems = []
       const declinedItems = []
@@ -1165,11 +1173,20 @@ exports.cancelPrescription = async (req, res) => {
   try {
     const prescription = await prisma.prescription.findUnique({ where: { id } })
     if (!prescription) return res.status(404).json({ error: 'Prescription not found' })
-    if (prescription.status !== 'pending') {
-      return res.status(400).json({ error: `Prescription is already ${prescription.status}` })
-    }
 
     const updated = await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM prescriptions WHERE id = ${id} FOR UPDATE`
+
+      const fresh = await tx.prescription.findUnique({
+        where: { id },
+        select: { status: true },
+      })
+      if (fresh?.status !== 'pending') {
+        throw Object.assign(
+          new Error(`Prescription is already ${fresh?.status ?? 'gone'}`),
+          { status: 409 }
+        )
+      }
       await tx.prescriptionItem.updateMany({
         where: { prescription_id: id },
         data: { status: 'cancelled' },
@@ -1222,6 +1239,7 @@ exports.cancelPrescription = async (req, res) => {
 
     res.json({ success: true, prescription: shapePrescription(updated) })
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message })
     console.error('cancelPrescription', err.message)
     res.status(500).json({ error: 'Failed to cancel prescription' })
   }
@@ -1630,26 +1648,24 @@ exports.createSaleReturn = async (req, res) => {
             staffId: currentUser?.id,
             note: `Returned from ${sale.receipt_number}`,
           })
-                } else {
-          await giveStock(tx, {
-            productId: p.item.product_id,
-            batch_id: p.item.product_batch_id ?? null,
-            quantity: p.quantity,
-            reason: 'return_to_stock',
-            refType: 'otc_sale_return',
-            refId: created.id,
-            staffId: currentUser?.id,
-            note: `Returned unsaleable from ${sale.receipt_number}`,
-          })
-
-          await takeStock(tx, {
-            productId: p.item.product_id,
-            quantity: p.quantity,
-            reason: 'writeoff',
-            refType: 'otc_sale_return',
-            refId: created.id,
-            staffId: currentUser?.id,
-            note: `${p.item.name} unsaleable${p.note ? ` — ${p.note}` : ''}`,
+        } else {
+          await tx.stockMovement.create({
+            data: {
+              product_id: p.item.product_id,
+              batch_id: p.item.product_batch_id ?? null,
+              delta: 0,
+              reason: 'writeoff',
+              ref_type: 'otc_sale_return',
+              ref_id: created.id,
+              balance_after: (await tx.product.findUnique({
+                where: { id: p.item.product_id },
+                select: { current_stock: true },
+              })).current_stock,
+              staff_id: currentUser?.id ?? null,
+              note:
+                `${p.quantity} × ${p.item.name} returned unsaleable from ` +
+                `${sale.receipt_number}${p.note ? ` — ${p.note}` : ''}`,
+            },
           })
         }
       }
@@ -2387,9 +2403,6 @@ exports.createStocktake = async (req, res) => {
       })
     }
 
-    // Rotating coverage without a classification table: least-recently-counted
-    // first, never-counted first of all. One ORDER BY does what A/B/C tiering
-    // does, with nothing to maintain.
     const where = { is_active: true }
     if (shelf_from && shelf_to) {
       where.shelf_location = { gte: String(shelf_from), lte: String(shelf_to) }
@@ -2506,11 +2519,34 @@ exports.getStocktake = async (req, res) => {
     })
     if (!session) return res.status(404).json({ error: 'Stocktake not found' })
 
-    const hide = session.blind && session.status === 'in_progress'
+       const hide = session.blind && session.status === 'in_progress'
+
+    // What trading did to each product since its own line was counted. This
+    // does not enter the arithmetic — shelf and system move together, so the
+    // variance is unchanged — but a large figure is a reason to look harder.
+    let movedByItem = new Map()
+    if (!hide) {
+      const rows = await prisma.$queryRaw`
+        SELECT si.id                          AS item_id,
+               COALESCE(SUM(sm.delta), 0)::int AS net,
+               COUNT(sm.id)::int               AS movements,
+               MAX(sm.created_at)              AS last_moved_at
+        FROM stocktake_items si
+        JOIN stock_movements sm
+          ON sm.product_id = si.product_id
+         AND sm.created_at > si.counted_at
+         AND sm.delta <> 0
+         AND sm.reason <> 'stocktake'
+        WHERE si.session_id = ${id} AND si.counted_at IS NOT NULL
+        GROUP BY si.id
+      `
+      movedByItem = new Map(rows.map((r) => [r.item_id, r]))
+    }
+
     return res.json({
       session: {
         ...shapeStocktakeMeta(session),
-        items: session.items.map((i) => shapeStocktakeItem(i, hide)),
+        items: session.items.map((i) => shapeStocktakeItem(i, hide, movedByItem.get(i.id))),
         stats: hide ? stocktakeProgress(session.items) : summariseStocktake(session.items),
       },
     })
@@ -2556,12 +2592,21 @@ exports.recordStocktakeCount = async (req, res) => {
         throw httpError('Counts are locked once the stocktake is submitted', 409)
       }
 
-      const item = await tx.stocktakeItem.findUnique({
+           const item = await tx.stocktakeItem.findUnique({
         where: { id: itemId },
-        select: { id: true, session_id: true, product_id: true, counted_at: true, counted_qty: true },
+        select: {
+          id: true, session_id: true, product_id: true,
+          counted_at: true, counted_qty: true, posted_at: true,
+        },
       })
       if (!item || item.session_id !== sessionId) {
         throw httpError('Item does not belong to this stocktake', 404)
+      }
+      // A partly approved session reopens for recount. Lines whose adjustment
+      // already moved stock must not be edited, or the recount would change a
+      // variance that has been posted.
+      if (item.posted_at != null) {
+        throw httpError('This line has already been adjusted and can no longer be edited', 409)
       }
 
       const data = {}
@@ -2617,8 +2662,6 @@ exports.recordStocktakeCount = async (req, res) => {
       }
     })
 
-    // Individual counts are not audited — 60 entries per session is noise. A
-    // recount that overwrites an existing figure is the interesting event.
     if (result.wasRecount) {
       await writeAuditLog({
         staffId: currentUser?.id,
@@ -2667,8 +2710,6 @@ exports.submitStocktake = async (req, res) => {
 
     const uncounted = session.items.length - counted.length
     if (uncounted > 0 && confirm_partial !== true) {
-      // Uncounted lines are EXCLUDED from adjustment, never treated as zero.
-      // Treating them as zero would let one careless submit write off the shelf.
       return res.status(409).json({
         error:
           `${uncounted} product(s) were never counted. They will be left unadjusted, ` +

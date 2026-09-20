@@ -79,7 +79,7 @@ router.put('/drug-stock/:id/quantity', c.updateStockItemQuantity)
 router.put('/lab-stock/:id', c.updateLabStockItem)
 
 // DELETE routes
-router.delete('/drug-stock/:id', c.deleteDrugStockItem)
+// router.delete('/drug-stock/:id', c.deleteDrugStockItem)
 router.delete('/charge-templates/:id', c.deleteChargeTemplate)
 router.delete('/sessions/:id', c.deleteSession)
 router.delete('/lab-stock/:id', c.deleteLabStockItem)
