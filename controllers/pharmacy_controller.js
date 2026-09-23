@@ -79,7 +79,7 @@ class ShortfallError extends Error {
 // ─── Stock ledger helpers ────────────────────────────────────────────────────
 
 
-module.exports.takeStock = async function (tx, { productId, quantity, reason, refType, refId, staffId, note }) {
+async  function takeStock(tx, { productId, quantity, reason, refType, refId, staffId, note }) {
   if (!productId || !quantity || quantity <= 0) return null
 
   await lockProduct(tx, productId)
@@ -190,7 +190,7 @@ module.exports.takeStock = async function (tx, { productId, quantity, reason, re
   }
 }
 
-module.exports.giveStock = async function (tx, { productId, quantity, batch_id, reason, refType, refId, staffId, note }) {
+async function giveStock(tx, { productId, quantity, batch_id, reason, refType, refId, staffId, note }) {
   if (!productId || !quantity || quantity <= 0) return null
 
   await lockProduct(tx, productId)
@@ -1351,7 +1351,7 @@ exports.createOtcSale = async (req, res) => {
           create: { name: customer_name.trim(), phone },
         })
 
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${LOCK.CUSTOMER}, ${customer.id})`
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${LOCK.CUSTOMER}::int, ${customer.id}::int)`
 
         const creditPortion = payments
           .filter((p) => p.method === 'credit')
@@ -2772,3 +2772,7 @@ exports.submitStocktake = async (req, res) => {
     return res.status(500).json({ error: 'Failed to submit stocktake' })
   }
 }
+
+// exports
+exports.takeStock = takeStock
+exports.giveStock = giveStock

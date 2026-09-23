@@ -1400,8 +1400,8 @@ module.exports.toggleStaffStatus = async (req, res) => {
     await writeAuditLog({
       staffId: req.user?.id,
       user: req.user?.username,
-      action: staff.is_active ? 'Staff Activated' : 'Staff Deactivated',
-      description: `${staff.is_active ? 'Activated' : 'Deactivated'} "${staff.username}" (${staff.role})`,
+      action: staff.is_active ? 'Staff Deactivated' : 'Staff Activated',
+      description: `${staff.is_active ? 'Deactivated' : 'Activated'} "${staff.username}" (${staff.role})`,
       category: 'staff',
       entity: 'Staff',
       entityId: staff.id,
@@ -2033,7 +2033,7 @@ module.exports.updateLabStockQuantity = async (req, res) => {
 
     if (newQuantity < 0) return res.status(400).json({ error: 'Quantity cannot be negative' })
 
-       const item = await prisma.labStock.update({
+    const item = await prisma.labStock.update({
       where: { id: Number(id) },
       data: { current_stock: newQuantity },
     })
@@ -2247,7 +2247,7 @@ module.exports.deleteSession = async (req, res) => {
 }
 
 
-module.exports.getDrugStock = async (req, res) => {
+module.exports.getPharmacyStock = async (req, res) => {
   const { search, category, expiry_filter, page = '1', limit = '20' } = req.query
   try {
     const where = {}
@@ -2398,6 +2398,43 @@ exports.getProductMovements = async (req, res) => {
 }
 
 
+module.exports.deletePharmacyStockItem = async (req, res) => {
+  const id = Number(req.params.id)
+  try {
+    const product = await prisma.product.findUnique({
+      where: { id },
+      select: { name: true, is_active: true, current_stock: true },
+    })
+    if (!product) return res.status(404).json({ error: 'Item not found' })
+    if (!product.is_active) return res.status(409).json({ error: `${product.name} is already deactivated` })
+    if (product.current_stock > 0) {
+      return res.status(409).json({
+        error: `${product.name} still has ${product.current_stock} in stock — clear it before deactivating`,
+      })
+    }
+
+    const { count } = await prisma.product.updateMany({
+      where: { id, is_active: true, current_stock: 0 },
+      data: { is_active: false },
+    })
+    if (count === 0) return res.status(409).json({ error: 'Stock changed while deactivating — reload and try again' })
+
+    await writeAuditLog({
+      staffId: req.user?.id,
+      user: req.user?.username,
+      action: 'Product Deactivated',
+      description: `Deactivated "${product.name}"`,
+      category: 'stock',
+      entity: 'Product',
+      entityId: id,
+      ipAddress: req.ip ?? null,
+    })
+    return res.json({ success: true })
+  } catch (error) {
+    console.error('deleteDrugStockItem error:', error.message)
+    return res.status(500).json({ error: 'Failed to deactivate item' })
+  }
+}
 module.exports.createStockItem = async (req, res) => {
   const {
     name, generic_name, category, sub_category, form, strength,
@@ -2939,7 +2976,7 @@ module.exports.verifyRestock = async (req, res) => {
   const ip = req.ip ?? req.headers['x-forwarded-for'] ?? null
 
   try {
-    const updated = await prisma.$transaction(async (tx) => {
+    const result = await prisma.$transaction(async (tx) => {
       const r = await tx.restockRequest.findUnique({ where: { id } })
       if (!r) throw Object.assign(new Error('Restock request not found'), { http: 404 })
       if (r.status !== 'pending')
@@ -3005,7 +3042,7 @@ module.exports.verifyRestock = async (req, res) => {
         })
       }
 
-            const request = await tx.restockRequest.update({
+      const request = await tx.restockRequest.update({
         where: { id },
         data: {
           status: 'approved',
@@ -3020,10 +3057,10 @@ module.exports.verifyRestock = async (req, res) => {
         },
       })
 
-      return { request, qty }
+      return { request, qty, requestedQty: r.quantity }
     })
 
-    const { request: updatedRequest, qty: approvedQty } = result
+    const { request: updatedRequest, qty: approvedQty, requestedQty } = result
     const stock = updatedRequest.product ?? updatedRequest.lab_stock
 
     await writeAuditLog({
@@ -3033,14 +3070,14 @@ module.exports.verifyRestock = async (req, res) => {
       description:
         `Verified restock of ${stock?.name ?? `request #${id}`} ` +
         `(+${approvedQty} ${stock?.unit ?? 'units'})` +
-        (approvedQty !== request.quantity ? ` — requested ${request.quantity}` : ''),
+        (approvedQty !== requestedQty ? ` — requested ${requestedQty}` : ''),
       category: 'restock',
       entity: 'RestockRequest',
       entityId: id,
       ipAddress: ip,
     })
 
-    return res.json({ success: true, restock: updated })
+    return res.json({ success: true, restock: updatedRequest })
   } catch (err) {
     if (err.http) return res.status(err.http).json({ error: err.message })
     if (err.code === 'P2025')
@@ -4059,7 +4096,7 @@ module.exports.rejectStocktake = async (req, res) => {
   }
 
   try {
-        const session = await prisma.stocktakeSession.findUnique({ where: { id } })
+    const session = await prisma.stocktakeSession.findUnique({ where: { id } })
     if (!session) return res.status(404).json({ error: 'Stocktake not found' })
 
     // Conditional write, not a check. A concurrent approve or return matches

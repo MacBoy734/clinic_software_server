@@ -8,16 +8,16 @@ function buildVisibilityWhere(staffId, role) {
       // True broadcast — no targeting at all
       // Json? fields require { equals: null } not bare null
       {
-        staff_id:        null,
+        staff_id: null,
         target_staff_id: null,
-        target_role:     { equals: null },
+        target_role: { equals: null },
       },
 
       // Role-targeted broadcast
       {
-        staff_id:        null,
+        staff_id: null,
         target_staff_id: null,
-        target_role:     { array_contains: role },
+        target_role: { array_contains: role },
       },
 
       // Directly targeted at this staff member
@@ -38,33 +38,33 @@ function last24hrsFilter() {
 // Shape a raw Prisma notification row into the API response object
 function shapeNotification(n) {
   return {
-    id:        n.id,
-    type:      n.type,
-    title:     n.title,
-    message:   n.message,
-    visit_id:  n.visit_id ?? null,
+    id: n.id,
+    type: n.type,
+    title: n.title,
+    message: n.message,
+    visit_id: n.visit_id ?? null,
     timestamp: n.timestamp,
-    is_read:   n.is_read,
+    is_read: n.is_read,
   }
 }
 
 module.exports.getNotifications = async (req, res) => {
   const staffId = req.user.id
-  const role    = req.user.role
+  const role = req.user.role
 
-  const page    = Math.max(1, Number(req.query.page) || 1)
+  const page = Math.max(1, Number(req.query.page) || 1)
   const perPage = Math.min(50, Math.max(1, Number(req.query.per_page) || PAGE_SIZE))
-  const hours   = req.query.hours !== undefined ? Number(req.query.hours) : 24
-  const skip    = (page - 1) * perPage
+  const hours = req.query.hours !== undefined ? Number(req.query.hours) : 24
+  const skip = (page - 1) * perPage
 
   const visibilityWhere = buildVisibilityWhere(staffId, role)
 
   const timeWhere = hours > 0
     ? (() => {
-        const since = new Date()
-        since.setHours(since.getHours() - hours)
-        return { timestamp: { gte: since } }
-      })()
+      const since = new Date()
+      since.setHours(since.getHours() - hours)
+      return { timestamp: { gte: since } }
+    })()
     : {}
 
   const where = {
@@ -101,13 +101,13 @@ module.exports.getNotifications = async (req, res) => {
 
     return res.json({
       notifications: notifications.map(shapeNotification),
-      unread_count:  unreadCount,
+      unread_count: unreadCount,
       pagination: {
         page,
-        per_page:    perPage,
+        per_page: perPage,
         total,
         total_pages: totalPages,
-        has_more:    page < totalPages,
+        has_more: page < totalPages,
       },
     })
   } catch (err) {
@@ -122,7 +122,7 @@ module.exports.getNotifications = async (req, res) => {
 // the same notifications (e.g. all doctors) — intended behavior.
 module.exports.markAllRead = async (req, res) => {
   const staffId = req.user.id
-  const role    = req.user.role
+  const role = req.user.role
 
   try {
     const { count } = await prisma.notification.updateMany({
@@ -156,14 +156,19 @@ module.exports.markAllRead = async (req, res) => {
 module.exports.createNotification = async (req, res) => {
   const { type, title, message, visit_id, target_role, target_staff_id, staff_id } = req.body
 
-  if (!type?.trim())    return res.status(400).json({ error: 'type is required' })
-  if (!title?.trim())   return res.status(400).json({ error: 'title is required' })
+  if (!type?.trim()) return res.status(400).json({ error: 'type is required' })
+  if (!title?.trim()) return res.status(400).json({ error: 'title is required' })
   if (!message?.trim()) return res.status(400).json({ error: 'message is required' })
 
   try {
-    const notification = await _create({
-      type, title, message, visit_id,
-      target_role, target_staff_id, staff_id,
+    const notification = await prisma.notification.create({
+      data: {
+        type, title, message,
+        visit_id: visit_id ?? null,
+        target_staff_id: target_staff_id ?? null,
+        staff_id: staff_id ?? null,
+        ...(target_role != null && { target_role }),
+      },
     })
     return res.status(201).json(shapeNotification(notification))
   } catch (err) {
